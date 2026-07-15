@@ -8966,6 +8966,20 @@ F:	Documentation/devicetree/bindings/display/xlnx/
 F:	Documentation/gpu/zynqmp.rst
 F:	drivers/gpu/drm/xlnx/
 
+DRM FABRIC
+M:	Konstantin Sinyuk <ksinyuk@kernel.org>
+M:	Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+R:	Francois Dugast <francois.dugast@intel.com>
+L:	dri-devel@lists.freedesktop.org
+S:	Maintained
+T:	git https://gitlab.freedesktop.org/drm/misc/kernel.git
+F:	Documentation/gpu/drm-fabric.rst
+F:	Documentation/netlink/specs/drm_fabric.yaml
+F:	drivers/gpu/drm/fabric/
+F:	include/drm/drm_fabric.h
+F:	include/uapi/drm/drm_fabric.h
+F:	tools/testing/selftests/drivers/gpu/drm_fabric/
+
 DRM GPU SCHEDULER
 M:	Matthew Brost <matthew.brost@intel.com>
 M:	Danilo Krummrich <dakr@kernel.org>
