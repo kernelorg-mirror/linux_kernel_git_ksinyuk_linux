@@ -1,0 +1,427 @@
+# SPDX-License-Identifier: ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)
+---
+name: drm-fabric
+protocol: genetlink
+uapi-header: drm/drm_fabric.h
+
+doc: |
+  Common object model for GPU and accelerator interconnect topology
+  (xGMI, UALink and similar), exposed over Generic Netlink.
+
+  A @fabric groups @endpoint objects; each @endpoint owns a fixed set of
+  @port objects; and a @port may carry a @peer naming the directly adjacent
+  far end. The core records direct adjacency only, and a @peer need not
+  resolve locally.
+
+  This read-only interface is confined to the initial network namespace.
+  Providers own topology; userspace queries it and receives notifications.
+  Replies and notifications carry a topology-generation token so an
+  interrupted or changed dump can be discarded and retried.
+
+definitions:
+  -
+    name: type
+    type: enum
+    value-start: 1
+    doc: >-
+      Fabric interconnect technology. New types are added with the provider
+      that first reports them. Zero is not a valid type.
+    entries:
+      - synthetic
+
+  -
+    name: port-state
+    type: enum
+    doc: Operational (link) state of a port, as observed by the driver.
+    entries:
+      - unknown
+      - inactive
+      - active
+      - degraded
+
+  -
+    name: peer-type
+    type: enum
+    value-start: 1
+    doc: Kind of device directly adjacent at a port's far end.
+    entries: [accel, switch]
+
+attribute-sets:
+  -
+    name: drm-fabric
+    enum-name: drm-fabric-a
+    doc: Top-level attributes, shared by all drm-fabric operations.
+    attributes:
+      -
+        name: fabric
+        type: nest
+        nested-attributes: fabric
+        doc: A fabric object (full nest).
+      -
+        name: endpoint
+        type: nest
+        nested-attributes: endpoint
+        doc: An endpoint object (full nest).
+      -
+        name: port
+        type: nest
+        nested-attributes: port
+        doc: A port object (full nest).
+      -
+        name: port-stats
+        type: nest
+        nested-attributes: port-stats
+        doc: Per-port statistics (full nest).
+      -
+        name: fabric-id
+        type: u32
+        doc: Kernel-local fabric identifier, assigned by the core.
+      -
+        name: endpoint-id
+        type: u32
+        doc: Kernel-local endpoint identifier, assigned by the core.
+      -
+        name: port-index
+        type: u32
+        doc: Per-endpoint port index.
+      -
+        name: dev-name
+        type: string
+        doc: Bus-specific identity (e.g. PCI BDF 0000:c1:00.0).
+      -
+        name: bus-name
+        type: string
+        doc: Disambiguate dev-name by bus (e.g. pci).
+      -
+        name: peer
+        type: nest
+        nested-attributes: peer
+        doc: A port's neighbor description (full nest).
+      -
+        name: topology-generation
+        type: u32
+        doc: >-
+          Family-global topology change token, not an event counter. Nonzero,
+          advances on every committed topology-visible transition and may wrap,
+          but zero is never emitted. Compare for equality only; treat any
+          change, or NLM_F_DUMP_INTR on a dump, as a reason to re-dump. A GET
+          or DUMP reply carries its snapshot's generation; a notification
+          carries the generation of its change. Statistics reads do not
+          advance it.
+
+  -
+    name: fabric
+    name-prefix: drm-fabric-a-fabric-attrs-
+    enum-name: drm-fabric-a-fabric-attrs
+    doc: Attributes describing a fabric object.
+    attributes:
+      -
+        name: pad
+        type: pad
+      -
+        name: fabric-id
+        type: u32
+        doc: Kernel-local fabric identifier, assigned by the core.
+      -
+        name: type
+        type: u32
+        enum: type
+        doc: Fabric interconnect technology, see enum type.
+      -
+        name: name
+        type: string
+        doc: Human-readable fabric name.
+      -
+        name: instance-id
+        type: u64
+        doc: Vendor-unique fabric instance identifier (e.g. a hive ID).
+
+  -
+    name: endpoint
+    name-prefix: drm-fabric-a-endpoint-attrs-
+    enum-name: drm-fabric-a-endpoint-attrs
+    doc: Attributes describing an endpoint object.
+    attributes:
+      -
+        name: pad
+        type: pad
+      -
+        name: endpoint-id
+        type: u32
+        doc: Kernel-local endpoint identifier, assigned by the core.
+      -
+        name: fabric-id
+        type: u32
+        doc: Identifier of the parent fabric.
+      -
+        name: fabric-ep-id
+        type: u64
+        doc: Vendor's stable fabric-local endpoint identifier.
+      -
+        name: name
+        type: string
+        doc: Human-readable endpoint name.
+      -
+        name: dev-name
+        type: string
+        doc: Bus-specific identity (e.g. PCI BDF 0000:c1:00.0).
+      -
+        name: bus-name
+        type: string
+        doc: The bus of the backing device (e.g. pci).
+
+  -
+    name: port
+    name-prefix: drm-fabric-a-port-attrs-
+    enum-name: drm-fabric-a-port-attrs
+    doc: Attributes describing a port object.
+    attributes:
+      -
+        name: port-index
+        type: u32
+        doc: Per-endpoint port index.
+      -
+        name: endpoint-id
+        type: u32
+        doc: Identifier of the endpoint that owns this port.
+      -
+        name: oper-state
+        type: u32
+        enum: port-state
+        doc: Port's operational state.
+
+      -
+        name: max-lane-count
+        type: u32
+        doc: >-
+          Maximum provider-reported lane count (link width capability).
+          0 means unknown or not reported.
+      -
+        name: max-lane-signaling-rate-mbps
+        type: u32
+        doc: >-
+          Maximum provider-reported per-lane signaling rate in decimal
+          megabits per second, before encoding, FEC and protocol overhead.
+          Zero means unknown. This is a capability, not the negotiated rate
+          or usable payload bandwidth.
+      -
+        name: peer
+        type: nest
+        nested-attributes: peer
+        doc: Peer info, absent if the port has no neighbor set.
+
+  -
+    name: peer
+    name-prefix: drm-fabric-a-peer-attrs-
+    enum-name: drm-fabric-a-peer-attrs
+    doc: Attributes describing a port's neighbor (peer).
+    attributes:
+      -
+        name: pad
+        type: pad
+      -
+        name: peer-id
+        type: u64
+        doc: >-
+          Type-qualified identity of the directly adjacent far-end object.
+          For type=accel, this is the far-end accelerator's fabric-ep-id; for
+          type=switch, it is an opaque provider-defined identity naming no
+          local endpoint. Accelerator and switch identities occupy separate
+          namespaces, and neither must resolve locally.
+      -
+        name: type
+        type: u32
+        enum: peer-type
+        doc: Kind of peer device; selects the namespace and meaning of peer-id.
+      -
+        name: port-index
+        type: u32
+        doc: Far-end port index, in the peer's own port numbering.
+
+  -
+    name: port-stats
+    name-prefix: drm-fabric-a-port-stats-attrs-
+    enum-name: drm-fabric-a-port-stats-attrs
+    doc: |-
+      Per-port statistics. All-or-none: on success every base counter is
+      present and zero is a valid count. A provider unable to supply the
+      complete base set returns -EOPNOTSUPP.
+    attributes:
+      -
+        name: pad
+        type: pad
+      -
+        name: endpoint-id
+        type: u32
+        doc: Identifier of the endpoint that owns the port.
+      -
+        name: port-index
+        type: u32
+        doc: Per-endpoint port index.
+      -
+        name: read-bytes
+        type: u64
+        doc: Bytes received on the port.
+      -
+        name: write-bytes
+        type: u64
+        doc: Bytes transmitted on the port.
+      -
+        name: link-down-count
+        type: u64
+        doc: Number of link-down transitions.
+      -
+        name: retrain-count
+        type: u64
+        doc: Number of link retrain events.
+
+operations:
+  enum-name: drm-fabric-cmd
+  list:
+    -
+      name: fabric-get
+      doc: Enumerate registered fabrics
+      attribute-set: drm-fabric
+      do:
+        request:
+          attributes:
+            - fabric-id
+        reply:
+          attributes:
+            - fabric
+            - topology-generation
+      dump:
+        reply:
+          attributes:
+            - fabric
+            - topology-generation
+
+    -
+      name: endpoint-get
+      doc: Enumerate registered endpoints, optionally filtered by fabric-id
+      attribute-set: drm-fabric
+      do:
+        request:
+          attributes:
+            - endpoint-id
+            - dev-name
+            - bus-name
+        reply:
+          attributes:
+            - endpoint
+            - topology-generation
+      dump:
+        request:
+          attributes:
+            - fabric-id
+        reply:
+          attributes:
+            - endpoint
+            - topology-generation
+
+    -
+      name: port-get
+      doc: Enumerate ports, optionally filtered by endpoint-id
+      attribute-set: drm-fabric
+      do:
+        request:
+          attributes:
+            - endpoint-id
+            - port-index
+        reply:
+          attributes:
+            - port
+            - topology-generation
+      dump:
+        request:
+          attributes:
+            - endpoint-id
+        reply:
+          attributes:
+            - port
+            - topology-generation
+
+    -
+      name: port-stats-get
+      doc: Query port-scoped statistics
+      attribute-set: drm-fabric
+      do:
+        request:
+          attributes:
+            - endpoint-id
+            - port-index
+        reply:
+          attributes:
+            - port-stats
+      dump:
+        request:
+          attributes:
+            - endpoint-id
+        reply:
+          attributes:
+            - port-stats
+
+    -
+      name: port-change-ntf
+      doc: |
+        Port state change notification. Reuses the port-get
+        reply shape (full port nest).
+      notify: port-get
+
+    -
+      name: port-peer-create-ntf
+      doc: A port's neighbor has been set.
+      attribute-set: drm-fabric
+      event:
+        attributes:
+          - endpoint-id
+          - port-index
+          - peer
+          - topology-generation
+
+    -
+      name: port-peer-delete-ntf
+      doc: A port's neighbor has been unset.
+      attribute-set: drm-fabric
+      event:
+        attributes:
+          - endpoint-id
+          - port-index
+          - peer
+          - topology-generation
+
+    -
+      name: endpoint-create-ntf
+      doc: |
+        Endpoint registration notification, fired after the endpoint is
+        committed to the registry. Reuses the endpoint-get reply shape
+        (full endpoint nest).
+      notify: endpoint-get
+
+    -
+      name: endpoint-delete-ntf
+      doc: |
+        Endpoint unregistration notification, fired before the endpoint is
+        removed from the registry so its identity is still resolvable.
+        Reuses the endpoint-get reply shape (full endpoint nest).
+      notify: endpoint-get
+
+    -
+      name: fabric-create-ntf
+      doc: |
+        Fabric registration notification, fired after the fabric is committed
+        to the registry. Reuses the fabric-get reply shape (full fabric nest).
+      notify: fabric-get
+
+    -
+      name: fabric-delete-ntf
+      doc: |
+        Fabric removal notification, fired before the fabric is removed from
+        the registry so its identity is still resolvable. Reuses the fabric-get
+        reply shape (full fabric nest).
+      notify: fabric-get
+
+mcast-groups:
+  list:
+    -
+      name: monitor
