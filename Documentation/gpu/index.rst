@@ -16,6 +16,7 @@ GPU Driver Developer's Guide
    driver-uapi
    drm-client
    drm-compute
+   drm-fabric
    drivers
    backlight
    vga-switcheroo

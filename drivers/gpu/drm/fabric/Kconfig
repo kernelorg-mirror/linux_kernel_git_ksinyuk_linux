@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config DRM_FABRIC
+	tristate "DRM fabric support"
+	depends on DRM && NET
+	help
+	  Enable DRM fabric support. This infrastructure provides the
+	  core object model and provider API for registered accelerator
+	  interconnect topologies.
+
+	  To compile this as a module, choose M here: the module will be
+	  called drm-fabric.
+
+	  If in doubt, say N.

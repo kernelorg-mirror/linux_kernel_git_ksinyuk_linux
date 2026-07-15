@@ -213,6 +213,7 @@ obj-y			+= panel/
 obj-y			+= bridge/
 obj-$(CONFIG_DRM_FSL_DCU) += fsl-dcu/
 obj-$(CONFIG_DRM_ETNAVIV) += etnaviv/
+obj-$(CONFIG_DRM_FABRIC) += fabric/
 obj-y			+= hisilicon/
 obj-y			+= mxsfb/
 obj-y			+= sysfb/
