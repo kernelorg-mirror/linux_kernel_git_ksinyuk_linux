@@ -4,9 +4,9 @@ config DRM_FABRIC
 	tristate "DRM fabric support"
 	depends on DRM && NET
 	help
-	  Enable DRM fabric support. This infrastructure provides the
-	  core object model and provider API for registered accelerator
-	  interconnect topologies.
+	  Enable DRM fabric support. This infrastructure exposes
+	  registered accelerator interconnect topologies to userspace
+	  through the drm-fabric generic netlink family.
 
 	  To compile this as a module, choose M here: the module will be
 	  called drm-fabric.

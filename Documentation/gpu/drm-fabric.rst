@@ -18,8 +18,8 @@ Key Goals:
   (xGMI, UALink and similar), enabling data-center discovery and monitoring.
 * Support read-only enumeration, monitoring and state queries for
   provider-owned topology.
-* Offer a flexible, future-proof interface that can be extended with new fabric
-  types and attributes without breaking the uAPI.
+* Allow new attributes and fabric types to be added without reusing existing
+  wire identifiers, so the uAPI extends without breaking existing consumers.
 * Allow multiple endpoints and ports per provider, so drivers can model
   accelerator attachments, links and their peers.
 
@@ -84,10 +84,14 @@ an accelerator on another node, or a local endpoint that merely unregistered
 -- so only the provider knows when a port's physical adjacency actually
 changed, and only the provider retracts or replaces the descriptor.
 
-Endpoint teardown removes the endpoint's owned half-edges without generating
-a separate event for each port: the delete already describes the transition,
-so removing an endpoint advances the topology generation once rather than
-once per child port.
+``port-peer-delete-ntf`` reports an explicitly retracted half-edge; it is
+not emitted when a peer merely becomes locally unresolvable, so its absence
+is not evidence the far end is still reachable.
+
+Endpoint teardown removes the endpoint's owned half-edges without
+generating a separate event for each port: the delete already describes
+the transition, so removing an endpoint advances the topology generation
+once rather than once per child port.
 
 Driver API
 ----------
@@ -175,3 +179,135 @@ objects and are not persistent hardware identities: they remain valid for the
 lifetime of the registered object, but may disappear or be reused after the
 object is unregistered. ``instance-id`` and ``fabric-ep-id`` carry
 provider-defined identity, whose scope is described by the containing object.
+
+Query operations
+================
+
+User space enumerates topology with four read-only commands, each supporting a
+single lookup (``do``) and a bulk dump (``dump``):
+
+* ``fabric-get`` -- enumerate fabrics (``do`` by ``fabric-id``, ``dump`` for all).
+* ``endpoint-get`` -- enumerate endpoints, optionally filtered by ``fabric-id``,
+  or resolve one by ``endpoint-id`` or backing ``dev-name``/``bus-name``.
+* ``port-get`` -- enumerate ports, filtered by ``endpoint-id``. Ports may report
+  the provider's maximum capability as ``max-lane-count`` and
+  ``max-lane-signaling-rate-mbps`` (zero means unknown); these are maxima, not
+  the currently negotiated width or rate.
+* ``port-stats-get`` -- per-port statistics, filtered by ``endpoint-id``. A
+  targeted request for a port whose provider does not implement
+  ``port_stats_get`` returns ``-EOPNOTSUPP``. During a dump, ports without
+  statistics support are omitted and enumeration continues with later ports;
+  any other provider error ends the dump.
+
+Notifications
+-------------
+
+Subscribe to the ``monitor`` multicast group to receive asynchronous change
+notifications. Full-object notifications reuse the shape of their matching
+``get`` reply and are declared with ``notify:``; peer-link notifications carry
+a partial payload and are declared with ``event:``.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Notification
+     - Trigger
+     - Payload
+   * - ``fabric-create-ntf``
+     - a fabric is registered by a provider
+     - reuses ``fabric-get``
+   * - ``fabric-delete-ntf``
+     - a provider-owned fabric is unregistered
+     - reuses ``fabric-get``
+   * - ``endpoint-create-ntf``
+     - an endpoint is registered
+     - reuses ``endpoint-get``
+   * - ``endpoint-delete-ntf``
+     - an endpoint is unregistered
+     - reuses ``endpoint-get``
+   * - ``port-change-ntf``
+     - a port's operational state changes
+     - reuses ``port-get``
+   * - ``port-peer-create-ntf``
+     - a port's peer descriptor is set by its provider
+     - partial (``event:``)
+   * - ``port-peer-delete-ntf``
+     - a port's peer descriptor is explicitly unset by its provider; never
+       emitted for an implicit half-edge loss (see `Peer semantics`_)
+     - partial (``event:``)
+
+Notifications are best-effort. A listener that detects loss, restarts, or
+receives an interrupted dump must rebuild state with the query commands.
+
+Topology generation and dump consistency
+----------------------------------------
+
+The core keeps a nonzero generation counter and advances it whenever topology or
+exposed state changes. It is surfaced as the ``topology-generation`` attribute on
+``fabric-get``, ``endpoint-get`` and ``port-get`` replies and on the topology
+notifications. A provider-reported change advances the generation before its
+notification is serialized, so an event carries the post-change value that a
+later ``get``/``dump`` will also report.
+
+``topology-generation`` is a change token, not a timestamp, liveness counter or
+event count: a changed value means topology changed, but the delta between two
+values has no defined meaning and the counter may wrap (it skips zero). Statistics
+reads do not advance it.
+
+The same value backs dump consistency. Every multipart dump samples it and calls
+``genl_dump_check_consistent()``; if it changes between dump batches, Generic
+Netlink marks the dump with ``NLM_F_DUMP_INTR``, meaning the snapshot may be torn.
+User space must then discard the partial result and retry the complete dump. The
+generation does not apply to statistics reads.
+
+Only a dump that serialized at least one entry can carry ``NLM_F_DUMP_INTR``,
+because Generic Netlink arms the consistency check on the first entry it emits.
+A dump that yields no entries at all cannot report interruption, so user space
+should treat an empty result as advisory and re-read ``topology-generation``
+before concluding that the topology is empty.
+
+Namespaces
+----------
+
+DRM Fabric objects describe host-global hardware and are not scoped per network
+namespace. Query and dump operations (``*-get``) are therefore accepted only from
+the initial network namespace; a request from any other network namespace fails
+with ``-EPERM``. The Generic Netlink family is registered ``netnsok`` (so it
+resolves in any network namespace and can return that policy error rather than
+being invisible), but the operations themselves remain confined to ``init_net``.
+Monitor notifications are likewise emitted only into ``init_net``, so a listener
+that joins the multicast group from another network namespace never receives
+them.
+
+Examples
+========
+
+Query the topology with the in-tree YNL tool, pointing it at the spec:
+
+.. code-block:: bash
+
+    # List all fabrics
+    ./tools/net/ynl/pyynl/cli.py \
+        --spec Documentation/netlink/specs/drm_fabric.yaml \
+        --dump fabric-get
+
+Replies follow the shapes described above; a provider must be registered for
+the topology to be non-empty.
+
+List the endpoints of a fabric:
+
+.. code-block:: bash
+
+    ./tools/net/ynl/pyynl/cli.py \
+        --spec Documentation/netlink/specs/drm_fabric.yaml \
+        --dump endpoint-get --json '{"fabric-id": 1}'
+
+Query a single port:
+
+.. code-block:: bash
+
+    ./tools/net/ynl/pyynl/cli.py \
+        --spec Documentation/netlink/specs/drm_fabric.yaml \
+        --do port-get --json '{"endpoint-id": 1, "port-index": 0}'
+
+The family name on the wire is ``drm-fabric``.

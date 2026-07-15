@@ -184,7 +184,7 @@ struct drm_fabric *drm_fabric_register(const struct drm_fabric_desc *desc)
 			       xa_limit_32b, GFP_KERNEL);
 		if (ret)
 			return ERR_PTR(ret);
-		drm_fabric_base_seq_inc();
+		drm_fabric_emit_fabric_create(fabric, drm_fabric_base_seq_inc());
 	}
 
 	return_ptr(fabric);
@@ -268,7 +268,9 @@ int drm_fabric_unregister(struct drm_fabric *fabric)
 		 */
 		if (WARN_ON_ONCE(drm_fabric_has_members(fabric)))
 			return -EBUSY;
-		drm_fabric_base_seq_inc();
+		/* Emit before the erase, while @fabric is still live. */
+		drm_fabric_emit_fabric_delete(fabric,
+					      drm_fabric_base_seq_inc());
 		xa_erase(&drm_fabric_xa, fabric->id);
 	}
 
@@ -408,7 +410,7 @@ drm_fabric_endpoint_register(struct drm_fabric *fabric,
 			break;
 		drm_fabric_get(fabric);
 
-		drm_fabric_base_seq_inc();
+		drm_fabric_emit_endpoint_create(ep, drm_fabric_base_seq_inc());
 	}
 
 	if (ret) {
@@ -497,7 +499,8 @@ void drm_fabric_endpoint_unregister(struct drm_fabric_endpoint *ep)
 	scoped_guard(mutex, &drm_fabric_lock) {
 		if (WARN_ON_ONCE(!drm_fabric_ep_is_registered(ep)))
 			return;
-		drm_fabric_base_seq_inc();
+		/* Emit before the erase, while @ep is still live. */
+		drm_fabric_emit_endpoint_delete(ep, drm_fabric_base_seq_inc());
 		xa_erase(&drm_fabric_ep_xa, ep->id);
 	}
 
@@ -585,7 +588,8 @@ int drm_fabric_port_set_peer(struct drm_fabric_port *port,
 			return -EEXIST;
 		port->peer = *peer;
 		port->has_peer = true;
-		drm_fabric_base_seq_inc();
+		drm_fabric_emit_port_peer_create(port, peer,
+						 drm_fabric_base_seq_inc());
 	}
 
 	return 0;
@@ -610,7 +614,9 @@ int drm_fabric_port_unset_peer(struct drm_fabric_port *port)
 	scoped_guard(mutex, &drm_fabric_lock) {
 		if (!port->has_peer)
 			return -ENOENT;
-		drm_fabric_base_seq_inc();
+		/* Emit before clearing to show the peer being removed. */
+		drm_fabric_emit_port_peer_delete(port, &port->peer,
+						 drm_fabric_base_seq_inc());
 		port->has_peer = false;
 		memset(&port->peer, 0, sizeof(port->peer));
 	}
@@ -652,19 +658,24 @@ void drm_fabric_port_set_oper(struct drm_fabric_port *port,
 		enum drm_fabric_port_state old = port->oper_state;
 
 		port->oper_state = state;
-		if (old != state)
-			drm_fabric_base_seq_inc();
+		if (old != state) {
+			u32 gen = drm_fabric_base_seq_inc();
+
+			drm_fabric_emit_port_change(port, gen);
+		}
 	}
 }
 EXPORT_SYMBOL(drm_fabric_port_set_oper);
 
 static int __init drm_fabric_init(void)
 {
-	return 0;
+	return drm_fabric_netlink_register();
 }
 
 static void __exit drm_fabric_exit(void)
 {
+	drm_fabric_netlink_unregister();
+
 	WARN_ON(!xa_empty(&drm_fabric_xa));
 	WARN_ON(!xa_empty(&drm_fabric_ep_xa));
 	xa_destroy(&drm_fabric_xa);
