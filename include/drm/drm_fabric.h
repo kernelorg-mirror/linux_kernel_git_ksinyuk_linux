@@ -4,8 +4,8 @@
  */
 
 /*
- * DRM Fabric driver API: common object model for GPU interconnect topology
- * (fabric, endpoint, port and peer relationships).
+ * Common object model for GPU interconnect topology: fabric, endpoint, port
+ * and peer relationships.
  */
 
 #ifndef __DRM_FABRIC_H__
@@ -16,22 +16,7 @@
 #include <linux/types.h>
 #include <linux/xarray.h>
 
-enum drm_fabric_type {
-	/* Zero is invalid; concrete fabric types start at 1. */
-	DRM_FABRIC_TYPE_SYNTHETIC = 1,
-};
-
-enum drm_fabric_port_state {
-	DRM_FABRIC_PORT_STATE_UNKNOWN,
-	DRM_FABRIC_PORT_STATE_INACTIVE,
-	DRM_FABRIC_PORT_STATE_ACTIVE,
-	DRM_FABRIC_PORT_STATE_DEGRADED,
-};
-
-enum drm_fabric_peer_type {
-	DRM_FABRIC_PEER_TYPE_ACCEL = 1,
-	DRM_FABRIC_PEER_TYPE_SWITCH,
-};
+#include <uapi/drm/drm_fabric.h>
 
 struct device;
 

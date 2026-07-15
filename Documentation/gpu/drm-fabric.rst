@@ -140,3 +140,38 @@ error return, warns and performs no teardown. Endpoint registration rejects a
 departed parent the same way. These checks prove current address membership
 only: they cannot tell an earlier incarnation from another object registered
 later at the same address.
+
+Generic Netlink family
+======================
+
+DRM Fabric is exposed through the ``drm-fabric`` Generic Netlink family.
+Dump enumeration and asynchronous notifications fit this multi-object model
+better than one-value-per-file sysfs. The family follows the YAML/ynl
+discipline used by DRM RAS; devlink's device hierarchy does not represent a
+fabric spanning multiple DRM devices.
+
+YAML specification
+------------------
+
+The interface is described in a YAML specification
+``Documentation/netlink/specs/drm_fabric.yaml``, which is the source of truth for
+the wire format. It auto-generates the uAPI header
+(``include/uapi/drm/drm_fabric.h``) and the kernel glue via
+``tools/net/ynl/pyynl/ynl_gen_c.py``. Generated files must never be edited by
+hand; regenerate them with ``tools/net/ynl/ynl-regen.sh`` after any spec change.
+
+uAPI stability
+--------------
+
+The YAML specification is the contract. New attributes, commands and enum values
+are added append-only; existing attribute numbers, command numbers and meanings
+are never reused. Requests are strictly validated, so an unknown attribute in a
+request is rejected; user space should ignore attributes it does not recognize
+in replies and notifications. The family is versioned through
+``DRM_FABRIC_FAMILY_VERSION``.
+
+Kernel-local ``fabric-id`` and ``endpoint-id`` values identify live registry
+objects and are not persistent hardware identities: they remain valid for the
+lifetime of the registered object, but may disappear or be reused after the
+object is unregistered. ``instance-id`` and ``fabric-ep-id`` carry
+provider-defined identity, whose scope is described by the containing object.
