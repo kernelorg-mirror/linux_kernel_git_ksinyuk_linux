@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0
+# Kernel config fragment required to run the drm_fabric kselftests.
+# Merge with: scripts/kconfig/merge_config.sh or make kselftest-merge.
+CONFIG_NET=y
+CONFIG_DRM=y
+CONFIG_DEBUG_FS=y
+CONFIG_DRM_FABRIC=m
+CONFIG_DRM_FABRIC_SIM=m
