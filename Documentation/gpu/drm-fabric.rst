@@ -357,3 +357,10 @@ Testing
 
 The object model is covered by KUnit when ``CONFIG_DRM_FABRIC_KUNIT_TEST`` is
 enabled. The test source is folded into the core translation unit.
+
+Generic Netlink ABI tests live under
+``tools/testing/selftests/drivers/gpu/drm_fabric``. They cover the YNL query
+paths, malformed policy input, generated-header synchronization, dump-cursor
+correctness across endpoint removal, ``NLM_F_DUMP_INTR`` handling, the opaque
+switch half-edge, and provider fault handling. See that directory's ``README.rst``
+for build and execution commands.
