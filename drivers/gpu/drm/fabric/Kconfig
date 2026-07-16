@@ -22,3 +22,19 @@ config DRM_FABRIC_SIM
 	  error injection, and port-state transitions.  These hooks are
 	  NOT part of the drm_fabric uAPI and are used only by selftests.
 	  Does not model UALink protocol traffic or memory semantics.
+
+config DRM_FABRIC_KUNIT_TEST
+	bool "DRM fabric object-model KUnit tests" if !KUNIT_ALL_TESTS
+	depends on DRM_FABRIC && KUNIT
+	depends on KUNIT=y || DRM_FABRIC=m
+	default KUNIT_ALL_TESTS
+	help
+	  Enable KUnit coverage for the drm_fabric object model.
+
+	  The tests are built into drm_fabric itself, so they need no exported
+	  symbols or test-only accessors in the production source.
+
+	  For more information on KUnit and unit tests in general, please refer
+	  to the KUnit documentation in Documentation/dev-tools/kunit/.
+
+	  If unsure, say N.
