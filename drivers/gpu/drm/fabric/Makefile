@@ -2,3 +2,6 @@
 
 obj-$(CONFIG_DRM_FABRIC) += drm-fabric.o
 drm-fabric-y := drm_fabric.o drm_fabric_netlink.o drm_fabric_nl.o
+
+obj-$(CONFIG_DRM_FABRIC_SIM) += drm-fabric-sim.o
+drm-fabric-sim-y := drm_fabric_sim.o

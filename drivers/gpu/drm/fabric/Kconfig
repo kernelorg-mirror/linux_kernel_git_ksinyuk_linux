@@ -12,3 +12,13 @@ config DRM_FABRIC
 	  called drm-fabric.
 
 	  If in doubt, say N.
+
+config DRM_FABRIC_SIM
+	tristate "DRM fabric synthetic provider (test-only)"
+	depends on DRM_FABRIC
+	help
+	  Synthetic provider for testing drm_fabric topology and ABI.
+	  Provides debugfs-only hooks for synthetic activity generation,
+	  error injection, and port-state transitions.  These hooks are
+	  NOT part of the drm_fabric uAPI and are used only by selftests.
+	  Does not model UALink protocol traffic or memory semantics.
