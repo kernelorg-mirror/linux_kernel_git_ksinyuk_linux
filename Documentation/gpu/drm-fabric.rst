@@ -351,3 +351,9 @@ and runtime endpoint add/remove. These files are unstable test controls and are
 not part of the uAPI; the stable, reviewed interface is the YAML-described
 Generic Netlink family. Tests mutate simulator state through debugfs and observe
 the result over Generic Netlink.
+
+Testing
+=======
+
+The object model is covered by KUnit when ``CONFIG_DRM_FABRIC_KUNIT_TEST`` is
+enabled. The test source is folded into the core translation unit.

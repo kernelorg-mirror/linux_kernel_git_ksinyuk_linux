@@ -688,3 +688,7 @@ module_exit(drm_fabric_exit);
 MODULE_AUTHOR("Intel Corporation");
 MODULE_DESCRIPTION("DRM fabric infrastructure");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_DRM_FABRIC_KUNIT_TEST)
+#include "drm_fabric_test.c"
+#endif
