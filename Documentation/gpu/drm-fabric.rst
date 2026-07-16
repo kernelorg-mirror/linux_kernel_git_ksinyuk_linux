@@ -291,16 +291,31 @@ Query the topology with the in-tree YNL tool, pointing it at the spec:
         --spec Documentation/netlink/specs/drm_fabric.yaml \
         --dump fabric-get
 
-Replies follow the shapes described above; a provider must be registered for
-the topology to be non-empty.
+Against drm_fabric_sim loaded with ``topology=linear num_endpoints=2``
+(both non-default, for a minimal example), this returns:
 
-List the endpoints of a fabric:
+.. code-block:: text
+
+    [{'fabric': {'fabric-id': 1, 'instance-id': 2156317438,
+                 'name': 'fabricsim', 'type': 'synthetic'},
+      'topology-generation': 18}]
+
+List the endpoints of that fabric:
 
 .. code-block:: bash
 
     ./tools/net/ynl/pyynl/cli.py \
         --spec Documentation/netlink/specs/drm_fabric.yaml \
         --dump endpoint-get --json '{"fabric-id": 1}'
+
+.. code-block:: text
+
+    [{'endpoint': {'bus-name': 'platform', 'dev-name': 'fabricsim.0',
+                   'endpoint-id': 0, 'fabric-ep-id': 256, 'fabric-id': 1,
+                   'name': 'sim-ep0'}, 'topology-generation': 18},
+     {'endpoint': {'bus-name': 'platform', 'dev-name': 'fabricsim.1',
+                   'endpoint-id': 1, 'fabric-ep-id': 257, 'fabric-id': 1,
+                   'name': 'sim-ep1'}, 'topology-generation': 18}]
 
 Query a single port:
 
@@ -310,4 +325,29 @@ Query a single port:
         --spec Documentation/netlink/specs/drm_fabric.yaml \
         --do port-get --json '{"endpoint-id": 1, "port-index": 0}'
 
+.. code-block:: text
+
+    {'port': {'endpoint-id': 1, 'max-lane-count': 4,
+              'max-lane-signaling-rate-mbps': 200000, 'oper-state': 'active',
+              'peer': {'peer-id': 256, 'port-index': 0, 'type': 'accel'},
+              'port-index': 0},
+     'topology-generation': 18}
+
 The family name on the wire is ``drm-fabric``.
+
+Synthetic provider
+==================
+
+``CONFIG_DRM_FABRIC_SIM`` builds ``drm-fabric-sim.ko``, a software-only provider
+modeled on netdevsim (Documentation/networking/devlink/netdevsim.rst) that drives
+the object model and uAPI without real hardware. Module parameters select a
+linear, mesh or switch-shaped topology and bound the number of endpoints and
+ports. The switch shape links every endpoint to an opaque switch peer
+(``peer-type = switch``) whose id does not resolve to an endpoint, exercising the
+directed half-edge model without a first-class switch object.
+
+Its debugfs knobs stimulate synthetic counter activity, operational-state changes
+and runtime endpoint add/remove. These files are unstable test controls and are
+not part of the uAPI; the stable, reviewed interface is the YAML-described
+Generic Netlink family. Tests mutate simulator state through debugfs and observe
+the result over Generic Netlink.
