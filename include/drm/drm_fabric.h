@@ -4,8 +4,8 @@
  */
 
 /*
- * DRM Fabric driver API: common object model for GPU interconnect topology
- * (fabric, endpoint, port and peer relationships).
+ * Common object model for GPU interconnect topology: fabric, endpoint, port
+ * and peer relationships.
  */
 
 #ifndef __DRM_FABRIC_H__
@@ -17,11 +17,6 @@
 #include <linux/xarray.h>
 
 #include <uapi/drm/drm_fabric.h>
-
-enum drm_fabric_admin_state {
-	DRM_FABRIC_ADMIN_STATE_DOWN = 1,
-	DRM_FABRIC_ADMIN_STATE_UP,
-};
 
 struct device;
 

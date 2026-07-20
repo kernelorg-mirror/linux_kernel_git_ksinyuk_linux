@@ -87,9 +87,11 @@ switch, an accelerator on another node, or a local endpoint that merely
 unregistered -- so only the provider knows when a port's physical adjacency
 actually changed, and only the provider retracts or replaces the descriptor.
 
-``port-peer-delete-ntf`` reports an explicitly retracted half-edge; it is
-not emitted when a peer merely becomes locally unresolvable, so its absence
-is not evidence the far end is still reachable.
+``port-peer-delete-ntf`` reports an explicitly retracted half-edge -- through
+the provider's own report or, on a userspace-managed port, a userspace
+``port-peer-del`` request -- and is never emitted when a peer merely becomes
+locally unresolvable, so its absence is not evidence the far end is still
+reachable.
 
 Endpoint teardown removes the endpoint's owned half-edges without
 generating a separate event for each port: the delete already describes
@@ -170,9 +172,9 @@ the mutation lock, so the nested acquisition would self-deadlock. A successful
 callback therefore cannot be invalidated before commit, and the post-callback
 checks are invariant assertions only.
 
-A fabric records whether it was created by a provider or by userspace. Only an
-empty userspace-created fabric may be deleted through the provisioning core;
-provider-owned and non-empty fabrics are rejected.
+A fabric records whether it was created by a provider
+(drm_fabric_register()) or by userspace (``fabric-new``); see
+`Provisioning`_ for the deletion rules.
 
 Generic Netlink family
 ======================
@@ -216,8 +218,9 @@ User space enumerates topology with four read-only commands, each supporting a
 single lookup (``do``) and a bulk dump (``dump``):
 
 * ``fabric-get`` -- enumerate fabrics (``do`` by ``fabric-id``, ``dump`` for all).
-* ``endpoint-get`` -- enumerate endpoints, optionally filtered by ``fabric-id``,
-  or resolve one by ``endpoint-id`` or backing ``dev-name``/``bus-name``.
+* ``endpoint-get`` -- enumerate endpoints, optionally filtered by ``fabric-id``
+  (0 selects orphans), or resolve one by ``endpoint-id`` or by its backing
+  ``dev-name`` with an optional ``bus-name``.
 * ``port-get`` -- enumerate ports, filtered by ``endpoint-id``. Ports may report
   the provider's maximum capability as ``max-lane-count`` and
   ``max-lane-signaling-rate-mbps`` (zero means unknown); these are maxima, not
@@ -243,10 +246,10 @@ a partial payload and are declared with ``event:``.
      - Trigger
      - Payload
    * - ``fabric-create-ntf``
-     - a fabric is registered by a provider
+     - a fabric is registered (provider or ``fabric-new``)
      - reuses ``fabric-get``
    * - ``fabric-delete-ntf``
-     - a provider-owned fabric is unregistered
+     - a fabric is unregistered or removed via ``fabric-del``
      - reuses ``fabric-get``
    * - ``endpoint-create-ntf``
      - an endpoint is registered
@@ -254,15 +257,19 @@ a partial payload and are declared with ``event:``.
    * - ``endpoint-delete-ntf``
      - an endpoint is unregistered
      - reuses ``endpoint-get``
+   * - ``endpoint-change-ntf``
+     - an endpoint's fabric attachment or administrative state changes
+     - reuses ``endpoint-get``
    * - ``port-change-ntf``
-     - a port's operational state changes
+     - a port's operational or administrative state changes
      - reuses ``port-get``
    * - ``port-peer-create-ntf``
-     - a port's peer descriptor is set by its provider
+     - a port's peer descriptor is set (provider or ``port-peer-new``)
      - partial (``event:``)
    * - ``port-peer-delete-ntf``
-     - a port's peer descriptor is explicitly unset by its provider; never
-       emitted for an implicit half-edge loss (see `Peer semantics`_)
+     - a port's peer descriptor is explicitly unset (provider or
+       ``port-peer-del``); never emitted for an implicit half-edge loss
+       (see `Peer semantics`_)
      - partial (``event:``)
 
 Notifications are best-effort. A listener that detects loss, restarts, or
@@ -274,9 +281,9 @@ Topology generation and dump consistency
 The core keeps a nonzero generation counter and advances it whenever topology or
 exposed state changes. It is surfaced as the ``topology-generation`` attribute on
 ``fabric-get``, ``endpoint-get`` and ``port-get`` replies and on the topology
-notifications. A provider-reported change advances the generation before its
-notification is serialized, so an event carries the post-change value that a
-later ``get``/``dump`` will also report.
+notifications. A committed change -- provider-reported or userspace mutation
+-- advances the generation before its notification is serialized, so an event
+carries the post-change value that a later ``get``/``dump`` will also report.
 
 ``topology-generation`` is a change token, not a timestamp, liveness counter or
 event count: a changed value means topology changed, but the delta between two
@@ -308,8 +315,8 @@ Monitor notifications are likewise emitted only into ``init_net``, so a listener
 that joins the multicast group from another network namespace never receives
 them.
 
-Examples
-========
+Query examples
+--------------
 
 Query the topology with the in-tree YNL tool, pointing it at the spec:
 
@@ -363,6 +370,78 @@ Query a single port:
      'topology-generation': 18}
 
 The family name on the wire is ``drm-fabric``.
+
+Provisioning
+============
+
+The provisioning interface requires ``CAP_NET_ADMIN``. ``fabric-new`` and
+``fabric-del`` are core-owned; the rest are serviced by the provider and
+return ``-EOPNOTSUPP`` where it does not implement the matching callback:
+
+* ``fabric-new`` -- create an empty, userspace-owned fabric. The request
+  carries a ``fabric-new-params`` nest with the fabric type, an optional name
+  and a provider-defined instance ID.
+* ``fabric-del`` -- delete an empty, userspace-owned fabric. Refuses a
+  provider-owned fabric (``-EPERM``) and a non-empty one (``-EBUSY``).
+* ``endpoint-set`` -- attach an orphan endpoint, selected by ``endpoint-id`` or
+  by its backing ``dev-name`` with an optional ``bus-name``, to a fabric;
+  detach it with ``fabric-id`` 0; and/or set its administrative state.
+* ``port-set`` -- set a port's administrative state.
+* ``port-peer-new`` / ``port-peer-del`` -- set or unset a port's neighbor
+  half-edge. Valid only on a userspace-managed port; a provider-managed port
+  returns ``-EOPNOTSUPP`` (see `Peer management mode`_).
+
+Mutation commands carry ``GENL_ADMIN_PERM`` and are additionally confined to
+``init_net``. ``GENL_ADMIN_PERM`` only checks ``CAP_NET_ADMIN`` in the caller's
+user namespace, which a process in a nested user and network namespace may
+hold; restricting mutators to ``init_net`` prevents container-local privilege
+from reconfiguring host-global topology.
+
+A userspace-created fabric additionally pins this module for as long as it
+remains registered: ``fabric-new`` takes the pin, ``fabric-del`` releases it.
+
+Peer management mode
+--------------------
+
+A port uses one peer-management mode, fixed by the provider at registration.
+
+In provider-managed mode, the provider reports peer creation and removal
+(drm_fabric_port_set_peer() / drm_fabric_port_unset_peer()) and userspace peer
+provisioning is unsupported (``port-peer-new`` / ``port-peer-del`` return
+``-EOPNOTSUPP``).
+
+In userspace-managed mode, peer creation and removal are requested through the
+provisioning API and the provider does not independently replace or retract the
+peer (drm_fabric_port_set_peer() / drm_fabric_port_unset_peer() return
+``-EOPNOTSUPP``).
+
+One authority per descriptor prevents concurrent updates from both sources.
+Setting an occupied port returns ``-EEXIST``; unsetting an empty port returns
+``-ENOENT``.
+
+Provisioning examples
+---------------------
+
+Provision with the in-tree YNL tool (root, initial namespace):
+
+.. code-block:: bash
+
+    # Create an empty fabric
+    ./tools/net/ynl/pyynl/cli.py \
+        --spec Documentation/netlink/specs/drm_fabric.yaml \
+        --do fabric-new \
+        --json '{"fabric-new-params": {"type": "synthetic", "instance-id": 42}}'
+
+The command returns a core-assigned ``fabric-id``. Use that value in the
+following requests.
+
+.. code-block:: bash
+
+    # Attach an orphan endpoint to the returned fabric
+    ./tools/net/ynl/pyynl/cli.py \
+        --spec Documentation/netlink/specs/drm_fabric.yaml \
+        --do endpoint-set \
+        --json '{"endpoint-id": 5, "fabric-id": <returned-fabric-id>}'
 
 Synthetic provider
 ==================
