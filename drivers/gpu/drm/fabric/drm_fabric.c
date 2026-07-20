@@ -791,7 +791,8 @@ int drm_fabric_user_fabric_del(u32 fabric_id)
 		/* Symmetric with FABRIC_NEW: only an empty fabric may be removed. */
 		if (drm_fabric_has_members(fabric))
 			return -EBUSY;
-		drm_fabric_base_seq_inc();
+		/* Notify while the userspace-owned fabric is still addressable by id. */
+		drm_fabric_emit_fabric_delete(fabric, drm_fabric_base_seq_inc());
 		xa_erase(&drm_fabric_xa, fabric->id);
 	}
 
@@ -904,7 +905,7 @@ int drm_fabric_endpoint_set(struct drm_fabric_endpoint *ep,
 		if (change.valid & DRM_FABRIC_EP_CHANGE_ADMIN)
 			ep->admin_state = change.admin;
 
-		drm_fabric_base_seq_inc();
+		drm_fabric_emit_endpoint_change(ep, drm_fabric_base_seq_inc());
 	}
 
 	return 0;

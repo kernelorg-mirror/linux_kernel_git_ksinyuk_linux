@@ -80,6 +80,7 @@ static int drm_fabric_fill_endpoint(struct sk_buff *skb,
 	    nla_put_u64_64bit(skb, DRM_FABRIC_A_ENDPOINT_ATTRS_FABRIC_EP_ID,
 			      ep->fabric_ep_id, DRM_FABRIC_A_ENDPOINT_ATTRS_PAD) ||
 	    nla_put_string(skb, DRM_FABRIC_A_ENDPOINT_ATTRS_NAME, ep->name) ||
+	    nla_put_u32(skb, DRM_FABRIC_A_ENDPOINT_ATTRS_ADMIN_STATE, ep->admin_state) ||
 	    nla_put_string(skb, DRM_FABRIC_A_ENDPOINT_ATTRS_DEV_NAME,
 			   dev_name(ep->parent)) ||
 	    nla_put_string(skb, DRM_FABRIC_A_ENDPOINT_ATTRS_BUS_NAME,
@@ -132,10 +133,14 @@ static int drm_fabric_fill_port(struct sk_buff *skb,
 	    nla_put_u32(skb, DRM_FABRIC_A_PORT_ATTRS_ENDPOINT_ID, port->endpoint->id) ||
 	    nla_put_u32(skb, DRM_FABRIC_A_PORT_ATTRS_OPER_STATE,
 			port->oper_state) ||
+	    nla_put_u32(skb, DRM_FABRIC_A_PORT_ATTRS_ADMIN_STATE,
+			port->admin_state) ||
 	    nla_put_u32(skb, DRM_FABRIC_A_PORT_ATTRS_MAX_LANE_COUNT,
 			port->max_lane_count) ||
 	    nla_put_u32(skb, DRM_FABRIC_A_PORT_ATTRS_MAX_LANE_SIGNALING_RATE_MBPS,
-			port->max_lane_signaling_rate_mbps)) {
+			port->max_lane_signaling_rate_mbps) ||
+	    nla_put_u32(skb, DRM_FABRIC_A_PORT_ATTRS_PEER_MODE,
+			port->peer_mode)) {
 		nla_nest_cancel(skb, nest);
 		return -EMSGSIZE;
 	}
@@ -846,6 +851,255 @@ int drm_fabric_nl_port_stats_get_dumpit(struct sk_buff *skb,
 	return ret;
 }
 
+/* Fabric create/delete have no target to resolve; only serialize mutation. */
+int drm_fabric_nl_pre_doit(const struct genl_split_ops *ops,
+			   struct sk_buff *skb, struct genl_info *info)
+{
+	int ret = drm_fabric_nl_host_only(genl_info_net(info));
+
+	if (ret)
+		return ret;
+
+	mutex_lock(&drm_fabric_mutation_lock);
+	return 0;
+}
+
+void drm_fabric_nl_post_doit(const struct genl_split_ops *ops,
+			     struct sk_buff *skb, struct genl_info *info)
+{
+	mutex_unlock(&drm_fabric_mutation_lock);
+}
+
+/*
+ * Pin the target in user_ptr[0]. Drop the mutation lock on failure because
+ * post_doit does not run when pre_doit fails.
+ */
+int drm_fabric_nl_endpoint_pre_doit(const struct genl_split_ops *ops,
+				    struct sk_buff *skb, struct genl_info *info)
+{
+	struct drm_fabric_endpoint *ep;
+	int ret = drm_fabric_nl_host_only(genl_info_net(info));
+
+	if (ret)
+		return ret;
+
+	mutex_lock(&drm_fabric_mutation_lock);
+
+	scoped_guard(mutex, &drm_fabric_lock) {
+		ep = drm_fabric_resolve_endpoint(info);
+		if (!IS_ERR(ep))
+			drm_fabric_endpoint_get(ep);
+	}
+
+	if (IS_ERR(ep)) {
+		mutex_unlock(&drm_fabric_mutation_lock);
+		return PTR_ERR(ep);
+	}
+
+	info->user_ptr[0] = ep;
+	return 0;
+}
+
+void drm_fabric_nl_endpoint_post_doit(const struct genl_split_ops *ops,
+				      struct sk_buff *skb,
+				      struct genl_info *info)
+{
+	drm_fabric_endpoint_put(info->user_ptr[0]);
+	mutex_unlock(&drm_fabric_mutation_lock);
+}
+
+int drm_fabric_nl_port_pre_doit(const struct genl_split_ops *ops,
+				struct sk_buff *skb, struct genl_info *info)
+{
+	struct drm_fabric_port *port;
+	u32 ep_id, port_idx;
+	int ret;
+
+	ret = drm_fabric_nl_host_only(genl_info_net(info));
+	if (ret)
+		return ret;
+
+	ret = drm_fabric_port_key(info, &ep_id, &port_idx);
+	if (ret)
+		return ret;
+
+	mutex_lock(&drm_fabric_mutation_lock);
+
+	port = drm_fabric_port_find_get(ep_id, port_idx);
+	if (IS_ERR(port)) {
+		mutex_unlock(&drm_fabric_mutation_lock);
+		return PTR_ERR(port);
+	}
+
+	info->user_ptr[0] = port;
+	return 0;
+}
+
+void drm_fabric_nl_port_post_doit(const struct genl_split_ops *ops,
+				  struct sk_buff *skb, struct genl_info *info)
+{
+	drm_fabric_port_put(info->user_ptr[0]);
+	mutex_unlock(&drm_fabric_mutation_lock);
+}
+
+static int drm_fabric_parse_new_params(struct genl_info *info,
+					enum drm_fabric_type *type,
+					const char **name, u64 *instance_id)
+{
+	if (GENL_REQ_ATTR_CHECK(info, DRM_FABRIC_A_TYPE) ||
+	    GENL_REQ_ATTR_CHECK(info, DRM_FABRIC_A_INSTANCE_ID))
+		return -EINVAL;
+
+	*type = nla_get_u32(info->attrs[DRM_FABRIC_A_TYPE]);
+	*instance_id = nla_get_u64(info->attrs[DRM_FABRIC_A_INSTANCE_ID]);
+	*name = info->attrs[DRM_FABRIC_A_NAME] ?
+		nla_data(info->attrs[DRM_FABRIC_A_NAME]) : NULL;
+	return 0;
+}
+
+int drm_fabric_nl_fabric_new_doit(struct sk_buff *skb,
+				  struct genl_info *info)
+{
+	enum drm_fabric_type type;
+	const char *name = NULL;
+	u64 instance_id;
+	struct sk_buff *msg;
+	struct nlattr *id_attr;
+	u32 fabric_id;
+	void *hdr;
+	int ret;
+
+	ret = drm_fabric_parse_new_params(info, &type, &name, &instance_id);
+	if (ret)
+		return ret;
+
+	/*
+	 * Reserve the id attribute before publishing: with the space already
+	 * committed the store cannot fail, so there is no create-then-withdraw
+	 * window.
+	 */
+	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+	if (!msg)
+		return -ENOMEM;
+
+	hdr = genlmsg_put(msg, info->snd_portid, info->snd_seq,
+			  &drm_fabric_nl_family, 0,
+			  DRM_FABRIC_CMD_FABRIC_NEW);
+	if (!hdr) {
+		nlmsg_free(msg);
+		return -EMSGSIZE;
+	}
+
+	id_attr = nla_reserve(msg, DRM_FABRIC_A_FABRIC_ID, sizeof(u32));
+	if (!id_attr) {
+		nlmsg_free(msg);
+		return -EMSGSIZE;
+	}
+
+	ret = drm_fabric_user_fabric_new(type, instance_id, name, &fabric_id);
+	if (ret) {
+		nlmsg_free(msg);
+		return ret;
+	}
+
+	/* nla_put_u32() copies a host-order u32 verbatim; so does this store. */
+	*(u32 *)nla_data(id_attr) = fabric_id;
+
+	genlmsg_end(msg, hdr);
+	return genlmsg_reply(msg, info);
+}
+
+int drm_fabric_nl_fabric_del_doit(struct sk_buff *skb,
+				  struct genl_info *info)
+{
+	u32 fabric_id;
+
+	if (GENL_REQ_ATTR_CHECK(info, DRM_FABRIC_A_FABRIC_ID))
+		return -EINVAL;
+
+	fabric_id = nla_get_u32(info->attrs[DRM_FABRIC_A_FABRIC_ID]);
+	return drm_fabric_user_fabric_del(fabric_id);
+}
+
+int drm_fabric_nl_endpoint_set_doit(struct sk_buff *skb,
+				    struct genl_info *info)
+{
+	struct drm_fabric_endpoint *ep = info->user_ptr[0];
+	struct drm_fabric_endpoint_change change = {};
+
+	if (info->attrs[DRM_FABRIC_A_FABRIC_ID]) {
+		change.valid |= DRM_FABRIC_EP_CHANGE_FABRIC;
+		change.fabric_id =
+			nla_get_u32(info->attrs[DRM_FABRIC_A_FABRIC_ID]);
+	}
+
+	if (info->attrs[DRM_FABRIC_A_ADMIN_STATE]) {
+		change.valid |= DRM_FABRIC_EP_CHANGE_ADMIN;
+		change.admin =
+			nla_get_u32(info->attrs[DRM_FABRIC_A_ADMIN_STATE]);
+	}
+
+	if (!change.valid)
+		return -EINVAL;
+
+	return drm_fabric_endpoint_set(ep, &change);
+}
+
+int drm_fabric_nl_port_set_doit(struct sk_buff *skb,
+				struct genl_info *info)
+{
+	struct drm_fabric_port *port = info->user_ptr[0];
+	enum drm_fabric_admin_state admin;
+
+	if (GENL_REQ_ATTR_CHECK(info, DRM_FABRIC_A_ADMIN_STATE))
+		return -EINVAL;
+
+	admin = nla_get_u32(info->attrs[DRM_FABRIC_A_ADMIN_STATE]);
+
+	return drm_fabric_port_set_admin(port, admin);
+}
+
+int drm_fabric_nl_port_peer_new_doit(struct sk_buff *skb,
+				     struct genl_info *info)
+{
+	struct drm_fabric_port *port = info->user_ptr[0];
+	struct nlattr *pa[DRM_FABRIC_A_PEER_ATTRS_MAX + 1];
+	struct drm_fabric_peer peer = {};
+	int ret;
+
+	if (GENL_REQ_ATTR_CHECK(info, DRM_FABRIC_A_PEER))
+		return -EINVAL;
+
+	ret = nla_parse_nested(pa, DRM_FABRIC_A_PEER_ATTRS_MAX,
+			       info->attrs[DRM_FABRIC_A_PEER],
+			       drm_fabric_peer_nl_policy, info->extack);
+	if (ret)
+		return ret;
+
+	/*
+	 * A nested policy cannot require members; require the complete peer
+	 * descriptor here.
+	 */
+	if (!pa[DRM_FABRIC_A_PEER_ATTRS_PEER_ID] ||
+	    !pa[DRM_FABRIC_A_PEER_ATTRS_TYPE] ||
+	    !pa[DRM_FABRIC_A_PEER_ATTRS_PORT_INDEX])
+		return -EINVAL;
+
+	peer.peer_id = nla_get_u64(pa[DRM_FABRIC_A_PEER_ATTRS_PEER_ID]);
+	peer.peer_type = nla_get_u32(pa[DRM_FABRIC_A_PEER_ATTRS_TYPE]);
+	peer.port_index = nla_get_u32(pa[DRM_FABRIC_A_PEER_ATTRS_PORT_INDEX]);
+
+	return drm_fabric_port_peer_new(port, &peer);
+}
+
+int drm_fabric_nl_port_peer_del_doit(struct sk_buff *skb,
+				     struct genl_info *info)
+{
+	struct drm_fabric_port *port = info->user_ptr[0];
+
+	return drm_fabric_port_peer_del(port);
+}
+
 void drm_fabric_emit_port_change(struct drm_fabric_port *port, u32 generation)
 {
 	struct sk_buff *msg;
@@ -979,6 +1233,12 @@ void drm_fabric_emit_endpoint_create(struct drm_fabric_endpoint *ep, u32 generat
 void drm_fabric_emit_endpoint_delete(struct drm_fabric_endpoint *ep, u32 generation)
 {
 	drm_fabric_endpoint_event_send(DRM_FABRIC_CMD_ENDPOINT_DELETE_NTF, ep,
+				       generation);
+}
+
+void drm_fabric_emit_endpoint_change(struct drm_fabric_endpoint *ep, u32 generation)
+{
+	drm_fabric_endpoint_event_send(DRM_FABRIC_CMD_ENDPOINT_CHANGE_NTF, ep,
 				       generation);
 }
 
