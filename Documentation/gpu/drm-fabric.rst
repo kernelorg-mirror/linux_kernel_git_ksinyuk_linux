@@ -18,6 +18,8 @@ Key Goals:
   (xGMI, UALink and similar), enabling data-center discovery and monitoring.
 * Support read-only enumeration, monitoring and state queries for
   provider-owned topology.
+* Support topology provisioning as an optional provider capability, covering
+  fabric and endpoint lifecycle, port administration and peer management.
 * Allow new attributes and fabric types to be added without reusing existing
   wire identifiers, so the uAPI extends without breaking existing consumers.
 * Allow multiple endpoints and ports per provider, so drivers can model
@@ -56,13 +58,14 @@ provider reports: for example, it may be a full mesh with no root, a linear
 chain, or a switch-based topology in which ports terminate at opaque switch
 peers rather than locally registered endpoints.
 
-A *peer* is a value descriptor, not a reference to a live kernel object: its
-``peer-id`` may name a remote accelerator managed by another OS or an opaque
-switch in another trust domain, and need not resolve in the local registry. The
-core stores one directed half-edge and does not require the reverse half-edge to
-exist, so removing an endpoint does not retract peer descriptors held by other
-endpoints. ``peer-type = switch`` only describes the kind of far end; it does
-not create a first-class switch object.
+An endpoint may be registered without a fabric. Such an endpoint is an *orphan*
+and reports ``fabric-id`` 0. A *peer* is a value descriptor, not a reference to
+a live kernel object: its ``peer-id`` may name a remote accelerator managed by
+another OS or an opaque switch in another trust domain, and need not resolve in
+the local registry. The core stores one directed half-edge and does not require
+the reverse half-edge to exist, so removing an endpoint does not retract peer
+descriptors held by other endpoints. ``peer-type = switch`` only describes the
+kind of far end; it does not create a first-class switch object.
 
 .. kernel-doc:: drivers/gpu/drm/fabric/drm_fabric.c
    :doc: DRM Fabric core
@@ -79,10 +82,10 @@ that half-edge. A peer is therefore topology as last set, not proof of live
 connectivity; liveness belongs to the fabric controller.
 
 The core never retracts a half-edge on its own. Failing to resolve a peer
-locally is not the same as the link going away -- the far end may be a switch,
-an accelerator on another node, or a local endpoint that merely unregistered
--- so only the provider knows when a port's physical adjacency actually
-changed, and only the provider retracts or replaces the descriptor.
+locally is not the same as the link going away -- the far end may be a
+switch, an accelerator on another node, or a local endpoint that merely
+unregistered -- so only the provider knows when a port's physical adjacency
+actually changed, and only the provider retracts or replaces the descriptor.
 
 ``port-peer-delete-ntf`` reports an explicitly retracted half-edge; it is
 not emitted when a peer merely becomes locally unresolvable, so its absence
@@ -105,11 +108,15 @@ Driver API
 Design scope and boundaries
 ===========================
 
-Vendor drivers retain hardware discovery, firmware interaction and the
-load/store data path; DRM Fabric represents only the topology and
-provider-reported state of DRM-managed accelerators, which is why it
-belongs in DRM. The interface does not define MMU programming, switch
-policy, key management, live migration, or any required user space daemon.
+The core records direct adjacency only, not end-to-end reachability or switch
+forwarding, which remain with the fabric controller. Vendor drivers retain
+hardware discovery, firmware interaction, memory semantics and the
+hardware-carried data path; DRM Fabric represents only the topology and
+control state of DRM-managed accelerators, which is why it belongs in DRM.
+It does not create a network device or own route computation, switch
+forwarding, transport or congestion control. The interface also does not
+define MMU programming, switch policy, key management, live migration, or
+any required user space daemon.
 
 DRM Fabric does not define in-network collective operations or how an
 endpoint or switch executes them. Such capabilities belong to the
@@ -123,27 +130,49 @@ strengthens the contract rather than breaking it.
 Object lifetime and locking
 ===========================
 
-All registry and object state is protected by ``drm_fabric_lock``. A fabric and
-its endpoints are created and torn down through the provider API; endpoint
-unregister removes the endpoint from the registry and frees its fixed set of
-ports. Fabric membership is tracked, so a provider must remove all member
-endpoints before unregistering a provider-owned fabric: drm_fabric_unregister()
-returns ``-EBUSY`` and leaves the fabric registered if any remain, so the
-provider must retry after removing them rather than treat the fabric as gone.
+Registry membership and object state are protected by ``drm_fabric_lock``;
+topology mutation is additionally serialised by ``drm_fabric_mutation_lock``,
+described below. A fabric and its endpoints are created and torn down through
+the provider API; endpoint unregister removes the endpoint from the registry
+and frees its fixed set of ports. Fabric membership is tracked, so a provider
+must remove all member endpoints before unregistering a provider-owned fabric:
+drm_fabric_unregister() returns ``-EBUSY`` and leaves the fabric registered if
+any remain, so the provider must retry after removing them rather than treat
+the fabric as gone.
 
 Objects are reference counted and a port is pinned through its owning endpoint.
 Endpoint unregister drops the registration reference and waits for outstanding
 pins before freeing the ports; fabric membership holds a fabric reference.
 
-Providers own object lifetime, so a provider must serialise endpoint
-registration against unregistration of the containing fabric. The unregister
-entry points compare the supplied pointer against the registry before
-dereferencing it, so a stale or repeated teardown is rejected: fabric
-unregistration returns ``-ENODEV``, and endpoint unregistration, having no
-error return, warns and performs no teardown. Endpoint registration rejects a
-departed parent the same way. These checks prove current address membership
-only: they cannot tell an earlier incarnation from another object registered
-later at the same address.
+Providers own object lifetime. The unregister entry points compare the supplied
+pointer against the registry before dereferencing it, so a stale or repeated
+teardown is rejected: fabric unregistration returns ``-ENODEV``, and endpoint
+unregistration, having no error return, warns and performs no teardown.
+Endpoint registration rejects a departed parent the same way. These checks
+prove current address membership only: they cannot tell an earlier incarnation
+from another object registered later at the same address. Only the provider
+knows its own object lifecycle.
+
+Netlink mutation commands additionally hold ``drm_fabric_mutation_lock`` across
+target resolution, the provider callback and the core commit. The lock order
+is::
+
+    drm_fabric_mutation_lock -> drm_fabric_lock
+
+Provider lifecycle operations that can invalidate a prepared mutation take the
+same mutation lock: endpoint registration as well as endpoint and fabric
+unregister. A provider-driven teardown therefore cannot race an in-flight
+mutation on the same object, and a registration cannot claim a fabric-scoped
+``fabric-ep-id`` after an attach has validated the identifier but before its
+provider callback completes. A provider must not invoke any of these lifecycle
+operations from one of its own mutation callbacks: the callback already holds
+the mutation lock, so the nested acquisition would self-deadlock. A successful
+callback therefore cannot be invalidated before commit, and the post-callback
+checks are invariant assertions only.
+
+A fabric records whether it was created by a provider or by userspace. Only an
+empty userspace-created fabric may be deleted through the provisioning core;
+provider-owned and non-empty fabrics are rejected.
 
 Generic Netlink family
 ======================
