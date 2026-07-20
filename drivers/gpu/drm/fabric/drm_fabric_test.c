@@ -112,13 +112,17 @@ static void drm_fabric_test_unregister_reports_removal(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, drm_fabric_unregister(fab), 0);
 }
 
-static void drm_fabric_test_endpoint_requires_fabric(struct kunit *test)
+/*
+ * A NULL fabric registers an orphan endpoint, which reports fabric-id 0
+ * and can be unregistered.
+ */
+static void drm_fabric_test_endpoint_orphan_register(struct kunit *test)
 {
 	struct device *fabrictest_dev = fabrictest_alloc_dev(test);
 	struct drm_fabric_port_desc pdesc = { .index = 0, .max_lane_count = 4 };
 	struct drm_fabric_endpoint_desc edesc = {
 		.fabric_ep_id = 1,
-		.name = "no-fabric",
+		.name = "orphan",
 		.parent = fabrictest_dev,
 		.ports = &pdesc,
 		.num_ports = 1,
@@ -126,9 +130,10 @@ static void drm_fabric_test_endpoint_requires_fabric(struct kunit *test)
 	struct drm_fabric_endpoint *ep;
 
 	ep = drm_fabric_endpoint_register(NULL, &edesc);
-	KUNIT_EXPECT_TRUE(test, IS_ERR(ep));
-	if (IS_ERR(ep))
-		KUNIT_EXPECT_EQ(test, PTR_ERR(ep), -EINVAL);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(ep));
+	KUNIT_EXPECT_EQ(test, drm_fabric_endpoint_fabric_id(ep), 0);
+
+	drm_fabric_endpoint_unregister(ep);
 }
 
 /* Registration must not walk a NULL port array. */
@@ -1280,7 +1285,7 @@ static struct kunit_case drm_fabric_test_cases[] = {
 	KUNIT_CASE(drm_fabric_test_unregister_reports_removal),
 	KUNIT_CASE(drm_fabric_test_instance_id_unique),
 	KUNIT_CASE(drm_fabric_test_endpoint_register),
-	KUNIT_CASE(drm_fabric_test_endpoint_requires_fabric),
+	KUNIT_CASE(drm_fabric_test_endpoint_orphan_register),
 	KUNIT_CASE(drm_fabric_test_endpoint_requires_port_array),
 	KUNIT_CASE(drm_fabric_test_endpoint_register_stale_fabric),
 	KUNIT_CASE(drm_fabric_test_unregister_rejects_non_member),

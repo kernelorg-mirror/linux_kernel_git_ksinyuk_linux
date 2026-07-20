@@ -4,8 +4,8 @@
  */
 
 /*
- * Common object model for GPU interconnect topology: fabric, endpoint, port
- * and peer relationships.
+ * DRM Fabric driver API: common object model for GPU interconnect topology
+ * (fabric, endpoint, port and peer relationships).
  */
 
 #ifndef __DRM_FABRIC_H__
@@ -18,7 +18,31 @@
 
 #include <uapi/drm/drm_fabric.h>
 
+enum drm_fabric_admin_state {
+	DRM_FABRIC_ADMIN_STATE_DOWN = 1,
+	DRM_FABRIC_ADMIN_STATE_UP,
+};
+
 struct device;
+
+/**
+ * enum drm_fabric_peer_mode - authority for a port's peer descriptor
+ * @DRM_FABRIC_PEER_MODE_PROVIDER: the provider reports the peer through
+ *	drm_fabric_port_set_peer() / drm_fabric_port_unset_peer(); the userspace
+ *	PORT_PEER_NEW / PORT_PEER_DEL path on the port returns -EOPNOTSUPP.
+ * @DRM_FABRIC_PEER_MODE_USERSPACE: userspace provisions the peer through
+ *	PORT_PEER_NEW / PORT_PEER_DEL (which invoke the provider programming
+ *	hooks); the provider must not call set_peer()/unset_peer() on the port,
+ *	and doing so returns -EOPNOTSUPP.
+ *
+ * One port, one peer descriptor, one source allowed to program it, fixed at
+ * registration. PROVIDER is the zero default, so a port that does not opt in
+ * is provider-managed.
+ */
+enum drm_fabric_peer_mode {
+	DRM_FABRIC_PEER_MODE_PROVIDER = 1,
+	DRM_FABRIC_PEER_MODE_USERSPACE,
+};
 
 /**
  * struct drm_fabric_port_desc - Port descriptor for drm_fabric_endpoint_register()
@@ -36,6 +60,9 @@ struct drm_fabric_port_desc {
 	 * usable bandwidth.
 	 */
 	u32 max_lane_signaling_rate_mbps;
+
+	/** @peer_mode: who may program the port's peer descriptor */
+	enum drm_fabric_peer_mode peer_mode;
 };
 
 /**
@@ -80,6 +107,19 @@ struct drm_fabric_desc {
 };
 
 /**
+ * enum drm_fabric_owner - lifecycle owner of a fabric object
+ * @DRM_FABRIC_OWNER_PROVIDER: created by a provider via drm_fabric_register();
+ *	only the provider may unregister it, never userspace FABRIC_DEL.
+ * @DRM_FABRIC_OWNER_USERSPACE: created by userspace via FABRIC_NEW; may be
+ *	deleted by userspace via FABRIC_DEL.
+ */
+enum drm_fabric_owner {
+	/* Zero value, so a kzalloc'd fabric is not deletable via FABRIC_DEL. */
+	DRM_FABRIC_OWNER_PROVIDER = 0,
+	DRM_FABRIC_OWNER_USERSPACE,
+};
+
+/**
  * struct drm_fabric - Fabric object
  */
 struct drm_fabric {
@@ -91,6 +131,8 @@ struct drm_fabric {
 	u64 instance_id;
 	/** @name: human-readable fabric name */
 	char name[32];
+	/** @owner: lifecycle owner, gates userspace FABRIC_DEL */
+	enum drm_fabric_owner owner;
 
 	/** @refs: reference count */
 	refcount_t refs;
@@ -108,8 +150,13 @@ struct drm_fabric_endpoint {
 	char name[32];
 	/** @parent: backing device, provides dev_name and bus_name */
 	struct device *parent;
+	/**
+	 * @admin_state: administrative state, initially DOWN for an orphan and
+	 *	UP for a fabric member
+	 */
+	enum drm_fabric_admin_state admin_state;
 
-	/** @fabric: parent fabric */
+	/** @fabric: parent fabric, NULL while orphaned */
 	struct drm_fabric *fabric;
 
 	/** @ops: provider driver callbacks */
@@ -132,12 +179,14 @@ struct drm_fabric_endpoint {
  * drm_fabric_endpoint_fabric_id() - Wire fabric-id for an endpoint
  * @ep: endpoint to query
  *
- * Return: the parent fabric id.
+ * An orphaned endpoint (no fabric) reports fabric-id 0 on the wire.
+ *
+ * Return: the parent fabric id, or 0 if the endpoint is orphaned.
  */
 static inline u32
 drm_fabric_endpoint_fabric_id(const struct drm_fabric_endpoint *ep)
 {
-	return ep->fabric->id;
+	return ep->fabric ? ep->fabric->id : 0;
 }
 
 /**
@@ -171,11 +220,15 @@ struct drm_fabric_port {
 	u32 index;
 	/** @oper_state: operational (link) state */
 	enum drm_fabric_port_state oper_state;
+	/** @admin_state: administrative (requested) state */
+	enum drm_fabric_admin_state admin_state;
 	/** @max_lane_count: as in &struct drm_fabric_port_desc */
 	u32 max_lane_count;
 	/** @max_lane_signaling_rate_mbps: as in &struct drm_fabric_port_desc */
 	u32 max_lane_signaling_rate_mbps;
 
+	/** @peer_mode: authority for @peer, fixed at registration */
+	enum drm_fabric_peer_mode peer_mode;
 	/** @has_peer: whether @peer holds a valid descriptor */
 	bool has_peer;
 	/** @peer: neighbor description, valid only while @has_peer is set */
@@ -204,10 +257,33 @@ struct drm_fabric_port_stats {
 };
 
 /**
+ * struct drm_fabric_endpoint_change - Requested endpoint change for the endpoint_set() callback
+ */
+struct drm_fabric_endpoint_change {
+#define DRM_FABRIC_EP_CHANGE_FABRIC	BIT(0)
+#define DRM_FABRIC_EP_CHANGE_ADMIN	BIT(1)
+	/** @valid: bitmask of %DRM_FABRIC_EP_CHANGE_* selecting which fields are meaningful */
+	u32 valid;
+
+	/** @fabric_id: target fabric, 0 to detach (%DRM_FABRIC_EP_CHANGE_FABRIC) */
+	u32 fabric_id;
+	/** @admin: requested admin state (%DRM_FABRIC_EP_CHANGE_ADMIN) */
+	enum drm_fabric_admin_state admin;
+};
+
+/**
  * struct drm_fabric_ops - Provider driver callbacks
  *
- * A callback that is not supplied makes the matching netlink operation return
- * -EOPNOTSUPP.
+ * A callback that is not supplied makes the matching netlink operation
+ * return -EOPNOTSUPP.
+ *
+ * All callbacks are invoked without drm_fabric_lock held and may sleep;
+ * see each callback's own doc below for any further constraint.
+ *
+ * The mutation callbacks (endpoint_set, port_set, port_peer_new,
+ * port_peer_del) run with drm_fabric_mutation_lock held, so a provider
+ * must not call drm_fabric_endpoint_unregister() from inside one: that
+ * call takes the same lock and would self-deadlock.
  */
 struct drm_fabric_ops {
 	/**
@@ -221,6 +297,24 @@ struct drm_fabric_ops {
 	 */
 	int (*port_stats_get)(struct drm_fabric_port *port,
 			      struct drm_fabric_port_stats *stats);
+
+	/** @endpoint_set: attach or detach an endpoint and/or set its admin state */
+	int (*endpoint_set)(struct drm_fabric_endpoint *ep,
+			    const struct drm_fabric_endpoint_change *change,
+			    struct drm_fabric *fabric);
+	/** @port_set: set a port's admin state */
+	int (*port_set)(struct drm_fabric_port *port,
+			enum drm_fabric_admin_state admin);
+	/**
+	 * @port_peer_new: program a port's neighbor. Reached only for a port
+	 * whose peer_mode is %DRM_FABRIC_PEER_MODE_USERSPACE; a
+	 * provider-managed port reports its peer through
+	 * drm_fabric_port_set_peer() instead.
+	 */
+	int (*port_peer_new)(struct drm_fabric_port *port,
+			     const struct drm_fabric_peer *peer);
+	/** @port_peer_del: unprogram a userspace-managed port's neighbor */
+	int (*port_peer_del)(struct drm_fabric_port *port);
 };
 
 struct drm_fabric *drm_fabric_register(const struct drm_fabric_desc *desc);
