@@ -13,10 +13,22 @@ doc: |
   far end. The core records direct adjacency only, and a @peer need not
   resolve locally.
 
-  This read-only interface is confined to the initial network namespace.
+  The interface is host-global and confined to the initial network
+  namespace. This is deliberate: the hardware has no per-namespace
+  identity, so no per-namespace fabric semantics are invented.
   Providers own topology; userspace queries it and receives notifications.
   Replies and notifications carry a topology-generation token so an
   interrupted or changed dump can be discarded and retried.
+
+  The provisioning surface (fabric-new, fabric-del, endpoint-set, port-set,
+  port-peer-new and port-peer-del) requires administrative permission and is
+  restricted to the initial network namespace. fabric-new and fabric-del are
+  implemented by the core and do not depend on a provider callback. The rest
+  are serviced by the provider and return -EOPNOTSUPP where it does not
+  implement the matching one.
+
+  The interface is extensible: new fabric types and attributes can be added
+  without breaking the uAPI.
 
 definitions:
   -
@@ -45,6 +57,22 @@ definitions:
     value-start: 1
     doc: Kind of device directly adjacent at a port's far end.
     entries: [accel, switch]
+
+  -
+    name: admin-state
+    type: enum
+    value-start: 1
+    doc: Administrative (requested) state of an endpoint or port.
+    entries: [down, up]
+
+  -
+    name: peer-mode
+    type: enum
+    value-start: 1
+    doc: >-
+      Authority for programming a port's peer descriptor. Zero is not a
+      valid mode.
+    entries: [provider, userspace]
 
 attribute-sets:
   -
@@ -108,6 +136,29 @@ attribute-sets:
           or DUMP reply carries its snapshot's generation; a notification
           carries the generation of its change. Statistics reads do not
           advance it.
+      # Provisioning request parameters
+      -
+        name: admin-state
+        type: u32
+        enum: admin-state
+        doc: Requested administrative state.
+      -
+        name: type
+        type: u32
+        enum: type
+        doc: Fabric interconnect technology, see enum type.
+      -
+        name: name
+        type: string
+        checks:
+          max-len: 31
+        doc: >-
+          Human-readable fabric name. Bounded to the core's storage so an
+          over-long name is rejected rather than silently truncated.
+      -
+        name: instance-id
+        type: u64
+        doc: Vendor-unique fabric instance identifier (e.g. a hive ID).
 
   -
     name: fabric
@@ -134,7 +185,9 @@ attribute-sets:
       -
         name: instance-id
         type: u64
-        doc: Vendor-unique fabric instance identifier (e.g. a hive ID).
+        doc: >-
+          Provider-assigned fabric instance identifier (e.g. a hive ID),
+          unique among registered fabrics of the same type.
 
   -
     name: endpoint
@@ -152,11 +205,17 @@ attribute-sets:
       -
         name: fabric-id
         type: u32
-        doc: Identifier of the parent fabric.
+        doc: Identifier of the parent fabric, 0 while unassigned.
       -
         name: fabric-ep-id
         type: u64
-        doc: Vendor's stable fabric-local endpoint identifier.
+        doc: >-
+          Provider-defined endpoint identity used within the fabric. The core
+          requires uniqueness among the current members of one fabric. An
+          unassigned endpoint does not participate in this uniqueness check;
+          the constraint is checked when the endpoint joins a fabric.
+          Providers may guarantee wider uniqueness and longer stability.
+          Assignment changes do not require the value to change.
       -
         name: name
         type: string
@@ -169,6 +228,15 @@ attribute-sets:
         name: bus-name
         type: string
         doc: The bus of the backing device (e.g. pci).
+      -
+        name: admin-state
+        type: u32
+        enum: admin-state
+        doc: >-
+          Endpoint's administrative state, represented independently of fabric
+          membership. Attachment and detachment do not implicitly modify it.
+          At registration an endpoint registered with a fabric starts up and
+          an unassigned endpoint starts down.
 
   -
     name: port
@@ -209,6 +277,19 @@ attribute-sets:
         type: nest
         nested-attributes: peer
         doc: Peer info, absent if the port has no neighbor set.
+      -
+        name: admin-state
+        type: u32
+        enum: admin-state
+        doc: Port's administrative state.
+      -
+        name: peer-mode
+        type: u32
+        enum: peer-mode
+        doc: >-
+          Whether the provider or userspace programs this port's peer
+          descriptor. Fixed at registration. port-peer-new and port-peer-del
+          return -EOPNOTSUPP on a provider-managed port.
 
   -
     name: peer
@@ -420,6 +501,119 @@ operations:
         the registry so its identity is still resolvable. Reuses the fabric-get
         reply shape (full fabric nest).
       notify: fabric-get
+
+    -
+      name: endpoint-change-ntf
+      doc: |
+        Endpoint state change notification.
+        Reuses the endpoint-get reply shape (full endpoint nest).
+      notify: endpoint-get
+
+    -
+      name: fabric-new
+      doc: >-
+        Create an empty fabric object representing a membership domain.
+        Endpoints join through endpoint-set.
+      attribute-set: drm-fabric
+      flags: [admin-perm]
+      do:
+        pre: drm-fabric-nl-pre-doit
+        post: drm-fabric-nl-post-doit
+        request:
+          attributes:
+            - type
+            - name
+            - instance-id
+        reply:
+          attributes:
+            - fabric-id
+
+    -
+      name: fabric-del
+      doc: >-
+        Delete an empty fabric object. The fabric must have no member
+        endpoints.
+      attribute-set: drm-fabric
+      flags: [admin-perm]
+      do:
+        pre: drm-fabric-nl-pre-doit
+        post: drm-fabric-nl-post-doit
+        request:
+          attributes:
+            - fabric-id
+
+    -
+      name: endpoint-set
+      doc: |
+        Attach or detach an endpoint and/or set its administrative state.
+
+        Membership and administrative state are independent endpoint
+        properties. A request may carry either or both. Both are delivered to
+        the provider as one transition and, on success, committed together,
+        advancing the topology generation once and emitting one notification.
+
+        Direct reassignment from one fabric to another is not supported.
+        Userspace detaches the endpoint and then attaches it to the target
+        fabric. These are independent transactions: if the attach fails, the
+        endpoint remains unassigned.
+
+        Success records the endpoint's assignment in the DRM Fabric object
+        model after the provider has accepted the transition. It is not proof
+        of active links, external routing completion, or end-to-end
+        reachability.
+      attribute-set: drm-fabric
+      flags: [admin-perm]
+      do:
+        pre: drm-fabric-nl-endpoint-pre-doit
+        post: drm-fabric-nl-endpoint-post-doit
+        request:
+          attributes:
+            - endpoint-id
+            - dev-name
+            - bus-name
+            - fabric-id
+            - admin-state
+
+    -
+      name: port-set
+      doc: Set a port's administrative state
+      attribute-set: drm-fabric
+      flags: [admin-perm]
+      do:
+        pre: drm-fabric-nl-port-pre-doit
+        post: drm-fabric-nl-port-post-doit
+        request:
+          attributes:
+            - endpoint-id
+            - port-index
+            - admin-state
+
+    -
+      name: port-peer-new
+      doc: Set a port's neighbor
+      attribute-set: drm-fabric
+      flags: [admin-perm]
+      do:
+        pre: drm-fabric-nl-port-pre-doit
+        post: drm-fabric-nl-port-post-doit
+        request:
+          attributes:
+            - endpoint-id
+            - port-index
+            - peer
+
+    -
+      name: port-peer-del
+      doc: Unset a port's neighbor
+      attribute-set: drm-fabric
+      flags: [admin-perm]
+      do:
+        pre: drm-fabric-nl-port-pre-doit
+        post: drm-fabric-nl-port-post-doit
+        request:
+          attributes:
+            - endpoint-id
+            - port-index
 
 mcast-groups:
   list:

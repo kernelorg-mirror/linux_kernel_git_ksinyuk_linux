@@ -4,8 +4,8 @@
  */
 
 /*
- * DRM Fabric driver API: common object model for GPU interconnect topology
- * (fabric, endpoint, port and peer relationships).
+ * Common object model for GPU interconnect topology: fabric, endpoint, port
+ * and peer relationships.
  */
 
 #ifndef __DRM_FABRIC_H__
@@ -18,31 +18,7 @@
 
 #include <uapi/drm/drm_fabric.h>
 
-enum drm_fabric_admin_state {
-	DRM_FABRIC_ADMIN_STATE_DOWN = 1,
-	DRM_FABRIC_ADMIN_STATE_UP,
-};
-
 struct device;
-
-/**
- * enum drm_fabric_peer_mode - authority for a port's peer descriptor
- * @DRM_FABRIC_PEER_MODE_PROVIDER: the provider reports the peer through
- *	drm_fabric_port_set_peer() / drm_fabric_port_unset_peer(); the userspace
- *	PORT_PEER_NEW / PORT_PEER_DEL path on the port returns -EOPNOTSUPP.
- * @DRM_FABRIC_PEER_MODE_USERSPACE: userspace provisions the peer through
- *	PORT_PEER_NEW / PORT_PEER_DEL (which invoke the provider programming
- *	hooks); the provider must not call set_peer()/unset_peer() on the port,
- *	and doing so returns -EOPNOTSUPP.
- *
- * One port, one peer descriptor, one source allowed to program it, fixed at
- * registration. PROVIDER is the zero default, so a port that does not opt in
- * is provider-managed.
- */
-enum drm_fabric_peer_mode {
-	DRM_FABRIC_PEER_MODE_PROVIDER = 1,
-	DRM_FABRIC_PEER_MODE_USERSPACE,
-};
 
 /**
  * struct drm_fabric_port_desc - Port descriptor for drm_fabric_endpoint_register()
@@ -71,9 +47,13 @@ struct drm_fabric_port_desc {
 struct drm_fabric_endpoint_desc {
 	/**
 	 * @fabric_ep_id: accelerator identity within the fabric's identity
-	 * domain, unique among its members and stable for the duration of
-	 * membership; a duplicate is rejected with -EEXIST. Distinct from the
-	 * core-assigned &drm_fabric_endpoint.id.
+	 * domain. The core requires uniqueness among a fabric's current
+	 * members only, checked when the endpoint joins; an unassigned
+	 * endpoint does not participate in the check, and a duplicate at
+	 * attach time is rejected with -EEXIST. Providers may guarantee
+	 * wider uniqueness and longer stability than the core requires;
+	 * a later assignment change does not require the value to change.
+	 * Distinct from the core-assigned &drm_fabric_endpoint.id.
 	 */
 	u64 fabric_ep_id;
 	/** @name: human-readable endpoint name */
@@ -144,19 +124,19 @@ struct drm_fabric {
 struct drm_fabric_endpoint {
 	/** @id: kernel-local identifier, assigned by the core */
 	u32 id;
-	/** @fabric_ep_id: provider's stable fabric-local identity */
+	/** @fabric_ep_id: as in &struct drm_fabric_endpoint_desc */
 	u64 fabric_ep_id;
 	/** @name: human-readable endpoint name */
 	char name[32];
 	/** @parent: backing device, provides dev_name and bus_name */
 	struct device *parent;
 	/**
-	 * @admin_state: administrative state, initially DOWN for an orphan and
-	 *	UP for a fabric member
+	 * @admin_state: administrative state, initially DOWN for an
+	 *	unassigned endpoint and UP for a fabric member
 	 */
 	enum drm_fabric_admin_state admin_state;
 
-	/** @fabric: parent fabric, NULL while orphaned */
+	/** @fabric: parent fabric, NULL while unassigned */
 	struct drm_fabric *fabric;
 
 	/** @ops: provider driver callbacks */
@@ -179,9 +159,9 @@ struct drm_fabric_endpoint {
  * drm_fabric_endpoint_fabric_id() - Wire fabric-id for an endpoint
  * @ep: endpoint to query
  *
- * An orphaned endpoint (no fabric) reports fabric-id 0 on the wire.
+ * An unassigned endpoint (no fabric) reports fabric-id 0 on the wire.
  *
- * Return: the parent fabric id, or 0 if the endpoint is orphaned.
+ * Return: the parent fabric id, or 0 if the endpoint is unassigned.
  */
 static inline u32
 drm_fabric_endpoint_fabric_id(const struct drm_fabric_endpoint *ep)
@@ -284,6 +264,12 @@ struct drm_fabric_endpoint_change {
  * port_peer_del) run with drm_fabric_mutation_lock held, so a provider
  * must not call drm_fabric_endpoint_unregister() from inside one: that
  * call takes the same lock and would self-deadlock.
+ *
+ * A mutation callback that fails must leave no partial externally visible
+ * effect: the core commits nothing on failure, so provider state and DRM
+ * Fabric state would otherwise diverge. This matters most for
+ * endpoint_set(), which may carry a membership change and an
+ * administrative-state change in one request.
  */
 struct drm_fabric_ops {
 	/**
