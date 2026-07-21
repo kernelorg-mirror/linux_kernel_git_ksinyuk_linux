@@ -32,6 +32,8 @@ static char *topology = "mesh";
 module_param(topology, charp, 0444);
 MODULE_PARM_DESC(topology, "Topology shape: linear, mesh, switch (default: mesh)");
 
+#define FABRICSIM_MAX_PORTS 16
+
 static int num_endpoints = 4;
 module_param(num_endpoints, int, 0444);
 MODULE_PARM_DESC(num_endpoints, "Number of endpoints (2-8, default: 4)");
@@ -39,6 +41,16 @@ MODULE_PARM_DESC(num_endpoints, "Number of endpoints (2-8, default: 4)");
 static int ports_per_ep = 4;
 module_param(ports_per_ep, int, 0444);
 MODULE_PARM_DESC(ports_per_ep, "Ports per endpoint (1-16, default: 4)");
+
+static bool readonly;
+module_param(readonly, bool, 0444);
+MODULE_PARM_DESC(readonly,
+		 "Register endpoints with query-only provider ops (default: false)");
+
+static int shared_parent_eps;
+module_param(shared_parent_eps, int, 0444);
+MODULE_PARM_DESC(shared_parent_eps,
+		 "Number of endpoints sharing one platform device (default: 0)");
 
 struct fabricsim_port_priv {
 	struct drm_fabric_port *port;
@@ -70,6 +82,7 @@ struct fabricsim_ep_priv {
 	int num_ports;
 	int slot;
 	bool runtime;
+	bool shared_parent;
 	struct dentry *dbg_dir;
 };
 
@@ -79,6 +92,8 @@ struct fabricsim_ep_priv {
 
 static struct drm_fabric *fabricsim_fabric;
 static struct fabricsim_ep_priv *fabricsim_slots[FABRICSIM_MAX_EPS];
+static struct platform_device *fabricsim_shared_pdev;
+static unsigned int fabricsim_shared_pdev_users;
 static int fabricsim_init_eps;
 static bool fabricsim_exiting;		/* gate runtime controls during teardown */
 /*
@@ -90,6 +105,7 @@ static struct dentry *fabricsim_debugfs_root;
 
 /* Test-only fault injection (debugfs). Sticky until cleared. */
 static bool fabricsim_fail_register;
+static bool fabricsim_fail_mutation;
 static u32 fabricsim_fail_errno = ENOMEM;
 
 /*
@@ -142,7 +158,48 @@ static int fabricsim_port_stats_get(struct drm_fabric_port *port,
 	return 0;
 }
 
+/* The mutation hooks only fail on request; the core owns the model. */
+static int fabricsim_endpoint_set(struct drm_fabric_endpoint *ep,
+				  const struct drm_fabric_endpoint_change *change,
+				  struct drm_fabric *fabric)
+{
+	if (fabricsim_fail_mutation)
+		return fabricsim_injected_errno();
+	return 0;
+}
+
+static int fabricsim_port_set(struct drm_fabric_port *port,
+			      enum drm_fabric_admin_state admin)
+{
+	if (fabricsim_fail_mutation)
+		return fabricsim_injected_errno();
+	return 0;
+}
+
+static int fabricsim_port_peer_new(struct drm_fabric_port *port,
+				   const struct drm_fabric_peer *peer)
+{
+	if (fabricsim_fail_mutation)
+		return fabricsim_injected_errno();
+	return 0;
+}
+
+static int fabricsim_port_peer_del(struct drm_fabric_port *port)
+{
+	if (fabricsim_fail_mutation)
+		return fabricsim_injected_errno();
+	return 0;
+}
+
 static const struct drm_fabric_ops fabricsim_ops = {
+	.port_stats_get		= fabricsim_port_stats_get,
+	.endpoint_set		= fabricsim_endpoint_set,
+	.port_set		= fabricsim_port_set,
+	.port_peer_new		= fabricsim_port_peer_new,
+	.port_peer_del		= fabricsim_port_peer_del,
+};
+
+static const struct drm_fabric_ops fabricsim_readonly_ops = {
 	.port_stats_get		= fabricsim_port_stats_get,
 };
 
@@ -343,12 +400,9 @@ static void fabricsim_link_linear(void)
 		struct drm_fabric_endpoint *ep_b = fabricsim_slots[i + 1]->ep;
 		struct drm_fabric_port *pa, *pb;
 
-		/*
-		 * Interior nodes consume two ports; stop rather than walk off
-		 * an endpoint's port array if it was sized too small.
-		 */
-		if (pa_idx >= fabricsim_slots[i]->num_ports ||
-		    pb_idx >= fabricsim_slots[i + 1]->num_ports)
+		/* -1 skips the reserved last port. */
+		if (pa_idx >= fabricsim_slots[i]->num_ports - 1 ||
+		    pb_idx >= fabricsim_slots[i + 1]->num_ports - 1)
 			break;
 
 		pa = fabricsim_slots[i]->ports[pa_idx].port;
@@ -379,7 +433,8 @@ static void fabricsim_link_mesh(void)
 			if (i == j)
 				continue;
 
-			if (port_idx >= fabricsim_slots[i]->num_ports)
+			/* -1 skips the reserved last port. */
+			if (port_idx >= fabricsim_slots[i]->num_ports - 1)
 				break;
 
 			/*
@@ -421,7 +476,8 @@ static void fabricsim_link_switch(void)
 		struct drm_fabric_port *leaf_port =
 			fabricsim_slots[i]->ports[0].port;
 
-		if (!leaf_port)
+		/* Port 0 is the uplink; skip an endpoint with only the reserved port. */
+		if (!leaf_port || fabricsim_slots[i]->num_ports < 2)
 			continue;
 
 		/* One directed half-edge from the leaf to an opaque switch. */
@@ -466,26 +522,72 @@ static void fabricsim_ep_debugfs_create(struct fabricsim_ep_priv *ep_priv)
 	}
 }
 
+static struct platform_device *fabricsim_parent_get_locked(int slot, bool *shared_parent)
+{
+	struct platform_device *pdev;
+
+	lockdep_assert_held(&fabricsim_lock);
+
+	if (shared_parent_eps > 0 && slot < shared_parent_eps) {
+		if (!fabricsim_shared_pdev) {
+			fabricsim_shared_pdev =
+				platform_device_register_simple("fabricsim", 0, NULL, 0);
+			if (IS_ERR(fabricsim_shared_pdev)) {
+				pdev = fabricsim_shared_pdev;
+				fabricsim_shared_pdev = NULL;
+				return pdev;
+			}
+		}
+
+		fabricsim_shared_pdev_users++;
+		*shared_parent = true;
+		return fabricsim_shared_pdev;
+	}
+
+	*shared_parent = false;
+	return platform_device_register_simple("fabricsim", slot, NULL, 0);
+}
+
+static void fabricsim_parent_put_locked(struct fabricsim_ep_priv *ep_priv)
+{
+	lockdep_assert_held(&fabricsim_lock);
+
+	if (!ep_priv->shared_parent) {
+		platform_device_unregister(ep_priv->pdev);
+		return;
+	}
+
+	if (WARN_ON(!fabricsim_shared_pdev_users))
+		return;
+
+	if (--fabricsim_shared_pdev_users == 0) {
+		platform_device_unregister(fabricsim_shared_pdev);
+		fabricsim_shared_pdev = NULL;
+	}
+}
+
 /*
- * Create one endpoint at @slot with @nports ports, registered as a member of
- * the synthetic fabric.  Returns the new ep_priv or an ERR_PTR.  Caller holds
+ * Create an endpoint at @slot with @nports ports. @orphan registers it
+ * without a fabric for a later ENDPOINT_SET attach. Caller holds
  * fabricsim_lock.
  */
-static struct fabricsim_ep_priv *fabricsim_make_ep(int slot, int nports)
+static struct fabricsim_ep_priv *fabricsim_make_ep(int slot, int nports,
+						   bool orphan)
 {
 	struct drm_fabric_endpoint_desc edesc = {};
-	struct drm_fabric_port_desc pdescs[16];
+	struct drm_fabric_port_desc pdescs[FABRICSIM_MAX_PORTS];
 	struct fabricsim_ep_priv *ep_priv;
 	struct platform_device *pdev;
 	char ep_name[32];
+	bool shared_parent;
 	int j, ret;
 
 	lockdep_assert_held(&fabricsim_lock);
 
 	if (nports < 1)
 		nports = 1;
-	if (nports > 16)
-		nports = 16;
+	if (nports > FABRICSIM_MAX_PORTS)
+		nports = FABRICSIM_MAX_PORTS;
 
 	/* Refuse before any allocation, so there is nothing to roll back. */
 	if (fabricsim_fail_register)
@@ -498,24 +600,32 @@ static struct fabricsim_ep_priv *fabricsim_make_ep(int slot, int nports)
 	ep_priv->slot = slot;
 	ep_priv->num_ports = nports;
 
-	pdev = platform_device_register_simple("fabricsim", slot, NULL, 0);
+	pdev = fabricsim_parent_get_locked(slot, &shared_parent);
 	if (IS_ERR(pdev)) {
 		ret = PTR_ERR(pdev);
 		goto err_free;
 	}
 	ep_priv->pdev = pdev;
+	ep_priv->shared_parent = shared_parent;
 
 	for (j = 0; j < nports; j++) {
 		pdescs[j].index = j;
 		pdescs[j].max_lane_count = 4;
 		pdescs[j].max_lane_signaling_rate_mbps = 200000; /* 200 Gbps/lane */
+		/*
+		 * Reserve the last port for userspace peer tests; a single-port
+		 * endpoint therefore has no provider-managed port.
+		 */
+		pdescs[j].peer_mode = (j == nports - 1) ?
+			DRM_FABRIC_PEER_MODE_USERSPACE :
+			DRM_FABRIC_PEER_MODE_PROVIDER;
 	}
 
 	snprintf(ep_name, sizeof(ep_name), "sim-ep%d", slot);
 	edesc.fabric_ep_id = 0x100 + slot;
 	edesc.name = ep_name;
 	edesc.parent = &pdev->dev;
-	edesc.ops = &fabricsim_ops;
+	edesc.ops = readonly ? &fabricsim_readonly_ops : &fabricsim_ops;
 	edesc.priv = ep_priv;
 	edesc.ports = pdescs;
 	edesc.num_ports = nports;
@@ -540,7 +650,8 @@ static struct fabricsim_ep_priv *fabricsim_make_ep(int slot, int nports)
 		timer_setup(&pp->activity_timer, fabricsim_activity_tick, 0);
 	}
 
-	ep_priv->ep = drm_fabric_endpoint_register(fabricsim_fabric, &edesc);
+	ep_priv->ep = drm_fabric_endpoint_register(orphan ? NULL : fabricsim_fabric,
+						   &edesc);
 	if (IS_ERR(ep_priv->ep)) {
 		ret = PTR_ERR(ep_priv->ep);
 		goto err_ports;
@@ -562,7 +673,7 @@ err_ports:
 		mutex_destroy(&ep_priv->ports[j].activity_lock);
 	kfree(ep_priv->ports);
 err_pdev:
-	platform_device_unregister(ep_priv->pdev);
+	fabricsim_parent_put_locked(ep_priv);
 err_free:
 	kfree(ep_priv);
 	return ERR_PTR(ret);
@@ -593,11 +704,11 @@ static void fabricsim_destroy_ep(struct fabricsim_ep_priv *ep_priv)
 
 	drm_fabric_endpoint_unregister(ep_priv->ep);
 	kfree(ep_priv->ports);
-	platform_device_unregister(ep_priv->pdev);
+	fabricsim_parent_put_locked(ep_priv);
 	kfree(ep_priv);
 }
 
-static int fabricsim_add_endpoint(int nports)
+static int fabricsim_add_endpoint(int nports, bool orphan)
 {
 	struct fabricsim_ep_priv *ep_priv;
 	int slot, ret;
@@ -616,7 +727,7 @@ static int fabricsim_add_endpoint(int nports)
 		return -ENOSPC;
 	}
 
-	ep_priv = fabricsim_make_ep(slot, nports);
+	ep_priv = fabricsim_make_ep(slot, nports, orphan);
 	if (IS_ERR(ep_priv)) {
 		ret = PTR_ERR(ep_priv);
 		mutex_unlock(&fabricsim_lock);
@@ -667,7 +778,7 @@ static int fabricsim_bulk_add(int n)
 		return -EINVAL;
 
 	while (added < n) {
-		ret = fabricsim_add_endpoint(1);
+		ret = fabricsim_add_endpoint(1, false);
 		if (ret < 0)
 			return added ? added : ret;
 		added++;
@@ -713,13 +824,26 @@ static int fabricsim_parse_int(const char __user *buf, size_t count, int dflt)
 	return val;
 }
 
+static ssize_t fabricsim_add_ep_common(const char __user *buf, size_t count,
+				       bool orphan)
+{
+	int nports = fabricsim_parse_int(buf, count, ports_per_ep);
+	int ret = fabricsim_add_endpoint(nports, orphan);
+
+	return ret < 0 ? ret : count;
+}
+
 static ssize_t fabricsim_add_ep_write(struct file *file, const char __user *buf,
 				      size_t count, loff_t *ppos)
 {
-	int nports = fabricsim_parse_int(buf, count, ports_per_ep);
-	int ret = fabricsim_add_endpoint(nports);
+	return fabricsim_add_ep_common(buf, count, false);
+}
 
-	return ret < 0 ? ret : count;
+static ssize_t fabricsim_add_orphan_write(struct file *file,
+					  const char __user *buf,
+					  size_t count, loff_t *ppos)
+{
+	return fabricsim_add_ep_common(buf, count, true);
 }
 
 static ssize_t fabricsim_del_ep_write(struct file *file, const char __user *buf,
@@ -734,6 +858,11 @@ static ssize_t fabricsim_del_ep_write(struct file *file, const char __user *buf,
 static const struct file_operations fabricsim_add_ep_fops = {
 	.owner	= THIS_MODULE,
 	.write	= fabricsim_add_ep_write,
+};
+
+static const struct file_operations fabricsim_add_orphan_fops = {
+	.owner	= THIS_MODULE,
+	.write	= fabricsim_add_orphan_write,
 };
 
 static const struct file_operations fabricsim_del_ep_fops = {
@@ -810,6 +939,8 @@ static const struct file_operations fabricsim_fail_errno_fops = {
  */
 static int __init fabricsim_setup_params(void)
 {
+	int wired;
+
 	/*
 	 * Reject an unrecognised topology rather than falling back to mesh, so
 	 * a typo cannot fake a shape.
@@ -827,25 +958,25 @@ static int __init fabricsim_setup_params(void)
 		num_endpoints = FABRICSIM_MAX_INIT_EPS;
 	if (ports_per_ep < 1)
 		ports_per_ep = 1;
-	if (ports_per_ep > 16)
-		ports_per_ep = 16;
+	if (ports_per_ep > FABRICSIM_MAX_PORTS)
+		ports_per_ep = FABRICSIM_MAX_PORTS;
 
-	/*
-	 * A mesh gives every endpoint (N-1) peers, so the busiest endpoint needs
-	 * at least (N-1) ports. The switch shape only needs one port per leaf
-	 * (a single half-edge to the opaque switch), so it is not bumped here.
-	 */
-	if (strcmp(topology, "mesh") == 0 && ports_per_ep < num_endpoints - 1)
-		ports_per_ep = num_endpoints - 1;
+	if (shared_parent_eps < 0)
+		shared_parent_eps = 0;
+	if (shared_parent_eps > FABRICSIM_MAX_EPS)
+		shared_parent_eps = FABRICSIM_MAX_EPS;
 
-	/*
-	 * A linear chain gives every interior node two neighbours, so it needs
-	 * at least two ports; bump a too-small request rather than index past
-	 * the endpoint's port array.
-	 */
-	if (strcmp(topology, "linear") == 0 && num_endpoints > 2 &&
-	    ports_per_ep < 2)
-		ports_per_ep = 2;
+	/* Peers wired per endpoint: mesh N-1, linear interior 2, switch 1. */
+	if (strcmp(topology, "mesh") == 0)
+		wired = num_endpoints - 1;
+	else if (strcmp(topology, "linear") == 0 && num_endpoints > 2)
+		wired = 2;
+	else
+		wired = 1;
+
+	/* make_ep() reserves the last port, so @wired alone drops an edge. */
+	if (ports_per_ep < wired + 1)
+		ports_per_ep = wired + 1;
 
 	fabricsim_init_eps = num_endpoints;
 
@@ -877,7 +1008,7 @@ static int __init fabricsim_init(void)
 	mutex_lock(&fabricsim_lock);
 	for (i = 0; i < fabricsim_init_eps; i++) {
 		struct fabricsim_ep_priv *ep_priv =
-			fabricsim_make_ep(i, ports_per_ep);
+			fabricsim_make_ep(i, ports_per_ep, false);
 
 		if (IS_ERR(ep_priv)) {
 			ret = PTR_ERR(ep_priv);
@@ -910,6 +1041,8 @@ static int __init fabricsim_init(void)
 	if (fabricsim_debugfs_root) {
 		debugfs_create_file("add_endpoint", 0200, fabricsim_debugfs_root,
 				    NULL, &fabricsim_add_ep_fops);
+		debugfs_create_file("add_orphan", 0200, fabricsim_debugfs_root,
+				    NULL, &fabricsim_add_orphan_fops);
 		debugfs_create_file("del_endpoint", 0200, fabricsim_debugfs_root,
 				    NULL, &fabricsim_del_ep_fops);
 
@@ -921,9 +1054,12 @@ static int __init fabricsim_init(void)
 		debugfs_create_bool("fail_register", 0644,
 				    fabricsim_debugfs_root,
 				    &fabricsim_fail_register);
-		debugfs_create_file("fail_errno", 0644,
+		debugfs_create_bool("fail_mutation", 0644,
 				    fabricsim_debugfs_root,
-				    NULL, &fabricsim_fail_errno_fops);
+				    &fabricsim_fail_mutation);
+		debugfs_create_file("fail_errno", 0644,
+				    fabricsim_debugfs_root, NULL,
+				    &fabricsim_fail_errno_fops);
 	}
 
 	pr_info("fabricsim: registered %s topology with %d endpoints, %d ports/ep\n",
