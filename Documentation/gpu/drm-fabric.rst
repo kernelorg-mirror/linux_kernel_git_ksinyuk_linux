@@ -454,6 +454,10 @@ ports. The switch shape links every endpoint to an opaque switch peer
 (``peer-type = switch``) whose id does not resolve to an endpoint, exercising the
 directed half-edge model without a first-class switch object.
 
+It implements the provisioning callbacks, so it is also the reference provider
+for the mutation commands. It reserves each endpoint's last port for userspace
+peer management and wires topology on the ports below it.
+
 Its debugfs knobs stimulate synthetic counter activity, operational-state changes
 and runtime endpoint add/remove. These files are unstable test controls and are
 not part of the uAPI; the stable, reviewed interface is the YAML-described
