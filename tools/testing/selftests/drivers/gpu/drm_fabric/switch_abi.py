@@ -4,7 +4,9 @@
 """
 fabricsim's "switch" shape links each leaf's first port to an opaque
 switch that is not a registered endpoint: asserts half-edge serialization
-and peer-id non-resolution, not leaf-switch-leaf reachability.
+and peer-id non-resolution, not leaf-switch-leaf reachability. A final case
+reloads at a one-port-per-endpoint request, where the port reserved for
+userspace peers would otherwise consume the only half-edge.
 
 --no-load is ignored (needs a fresh insmod). Run as root.
 """
@@ -78,11 +80,38 @@ def test_switch_id_does_not_resolve(ksft, cfg):
                % sorted(leaked))
 
 
+def test_minimum_request_preserves_switch_wiring(ksft, cfg):
+    """A one-port-per-endpoint request must still leave the switch wired:
+    setup raises the count so the reserved userspace port does not consume
+    the only half-edge.
+
+    Runs last: it reloads the sim, invalidating the snapshot above.
+    """
+    fab = cfg.fab
+    L.rmmod("drm_fabric_sim")
+    if not L.insmod("drm-fabric-sim.ko", "topology=switch", "ports_per_ep=1"):
+        ksft.skip("switch-minimum-request-wired",
+                  "could not load sim with ports_per_ep=1")
+        return
+    if not L.wait_until(lambda: L.module_loaded("drm_fabric_sim")):
+        ksft.skip("switch-minimum-request-wired", "sim did not reappear")
+        return
+
+    eps = [e["endpoint"] for e in fab.dump("endpoint-get", {})]
+    sim_eps = [e for e in eps if e["name"].startswith("sim-ep")]
+    peers = switch_peers(fab, sim_eps)
+    ksft.check(bool(sim_eps) and len(peers) == len(sim_eps),
+               "switch-minimum-request-wired",
+               "ports_per_ep=1: switch-peers=%d leaves=%d"
+               % (len(peers), len(sim_eps)))
+
+
 CASES = (
     test_every_leaf_has_switch_peer,
     test_half_edge_fully_serialized,
     test_single_opaque_switch_id,
     test_switch_id_does_not_resolve,
+    test_minimum_request_preserves_switch_wiring,
 )
 
 

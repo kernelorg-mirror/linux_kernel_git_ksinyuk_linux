@@ -2,6 +2,11 @@
 # Kernel config fragment required to run the drm_fabric kselftests.
 # Merge with: scripts/kconfig/merge_config.sh or make kselftest-merge.
 CONFIG_NET=y
+# netns_abi.py drives the init_net restriction from a non-initial namespace.
+# USER_NS lets it model container root; without it the suite still runs, using
+# a network namespace alone.
+CONFIG_NET_NS=y
+CONFIG_USER_NS=y
 CONFIG_DRM=y
 CONFIG_DEBUG_FS=y
 CONFIG_DRM_FABRIC=m

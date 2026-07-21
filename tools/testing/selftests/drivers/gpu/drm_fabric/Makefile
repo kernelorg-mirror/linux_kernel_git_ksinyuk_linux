@@ -11,6 +11,7 @@
 TEST_PROGS := \
 	check-spec-regen.sh \
 	fabric_abi.py \
+	endpoint_set_contract_abi.py \
 	nl_policy_probe.py \
 	dump_intr_abi.py \
 	port_cursor_abi.py \
@@ -18,7 +19,12 @@ TEST_PROGS := \
 	hotplug_abi.py \
 	dump_scale_abi.py \
 	switch_abi.py \
+	readonly_provider_abi.py \
+	ambiguous_parent_abi.py \
+	cap_netadmin.py \
+	netns_abi.py \
 	fault_abi.py \
+	provisioning_scenarios_abi.py \
 	harness_reset_abi.py
 
 TEST_FILES := lib_drm_fabric.py
