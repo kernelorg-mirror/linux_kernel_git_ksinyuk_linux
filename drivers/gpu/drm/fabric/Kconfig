@@ -29,7 +29,8 @@ config DRM_FABRIC_KUNIT_TEST
 	depends on KUNIT=y || DRM_FABRIC=m
 	default KUNIT_ALL_TESTS
 	help
-	  Enable KUnit coverage for the drm_fabric object model.
+	  KUnit tests for the drm_fabric object model and topology-mutation
+	  paths.
 
 	  The tests are built into drm_fabric itself, so they need no exported
 	  symbols or test-only accessors in the production source.
