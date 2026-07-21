@@ -474,5 +474,6 @@ Generic Netlink ABI tests live under
 ``tools/testing/selftests/drivers/gpu/drm_fabric``. They cover the YNL query
 paths, malformed policy input, generated-header synchronization, dump-cursor
 correctness across endpoint removal, ``NLM_F_DUMP_INTR`` handling, the opaque
-switch half-edge, and provider fault handling. See that directory's ``README.rst``
+switch half-edge, ``CAP_NET_ADMIN`` gating and provisioning rejects, and
+provider fault-injection failure atomicity. See that directory's ``README.rst``
 for build and execution commands.

@@ -267,6 +267,16 @@ def family_has_op(fab, name):
     return name in getattr(fab, "ops", {})
 
 
+def select_cases(fab, cases, mutation_cases, probe="fabric-new"):
+    """Return @cases, dropping @mutation_cases when @probe (a representative
+    mutation op) is absent from the family.
+    """
+    if family_has_op(fab, probe):
+        return tuple(cases)
+    drop = set(mutation_cases)
+    return tuple(c for c in cases if c not in drop)
+
+
 # System helpers (kselftest runs as root)
 
 def is_root():
@@ -462,6 +472,13 @@ def fabricsim(ksft, topology=None, need_debugfs=False, need_control=None,
         if not insmod("drm-fabric.ko") or not insmod("drm-fabric-sim.ko"):
             ksft.skip_all("could not load drm_fabric + drm_fabric_sim modules")
         wait_until(lambda: module_loaded("drm_fabric_sim"))
+    else:
+        # Running against providers somebody else loaded (--no-load, or a
+        # previous suite that restored the sim but kept the core). There is no
+        # module to unwind, but the suite can still add endpoints and peers,
+        # and without a teardown that state would leak into the next suite and
+        # survive the timeout killer's SIGTERM. Restore the default shape.
+        on_teardown(sim_restore_default)
 
     if not module_loaded("drm_fabric_sim"):
         ksft.skip_all("drm_fabric_sim not loaded")

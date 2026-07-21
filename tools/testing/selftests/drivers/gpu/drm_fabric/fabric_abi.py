@@ -9,6 +9,7 @@ are immune to CLI text changes.
 Usage: fabric_abi.py [--no-load]   (--no-load: modules already loaded)
 """
 
+import errno
 import os
 import sys
 
@@ -246,6 +247,33 @@ def test_port_change_ntf(ksft, cfg):
     L.dbg_write("ep1/port1/oper_state", "active")
 
 
+def test_endpoint_change_ntf(ksft, cfg):
+    # ENDPOINT_CHANGE_NTF is emitted by an attribute change (endpoint-set), not
+    # by unregister -- removing a provider emits ENDPOINT_DELETE_NTF instead.
+    # Toggle a live endpoint's admin state to provoke the change event, then
+    # restore the original state so later cases are unaffected.
+    fab, NlError = cfg.fab, cfg.NlError
+    ep = fab.do("endpoint-get", {"endpoint-id": 0})["endpoint"]
+    cur = ep.get("admin-state")
+    target = "down" if cur == "up" else "up"
+    ev = L.DrmFabric()
+    ev.ntf_subscribe(L.MCAST_MONITOR)
+    L.settle(EVT_SETTLE)
+    try:
+        fab.do("endpoint-set", {"endpoint-id": 0, "admin-state": target})
+    except NlError as exc:
+        ksft.not_ok("endpoint-change-ntf-notification",
+                    "endpoint-set errno=%d" % exc.error)
+        return
+    got = L.wait_ntf(ev, "endpoint-change-ntf", timeout=EVT_DURATION,
+                     match=lambda n: n["msg"]["endpoint"].get("endpoint-id") == 0)
+    try:
+        fab.do("endpoint-set", {"endpoint-id": 0, "admin-state": cur})
+    except NlError:
+        pass
+    ksft.check(got is not None, "endpoint-change-ntf-notification")
+
+
 def test_linear_topology(ksft, cfg):
     """Reload the sim into the linear topology and assert the chain shape.
     Restores the default mesh K_4 on the way out (even on failure), so
@@ -334,6 +362,119 @@ def test_link_down_exact_count(ksft, cfg):
     L.dbg_write("ep3/port1/inject", "recover_to_active")
 
 
+def test_stats_survive_mutation(ksft, cfg):
+    if not cfg.dfs:
+        ksft.skip("stats-counters-survive-mutation", "debugfs not available")
+        return
+    fab, NlError = cfg.fab, cfg.NlError
+    L.dbg_write("ep2/port0/inject", "link_down")
+    L.dbg_write("ep2/port0/inject", "link_down")
+    pre = fab.do("port-stats-get",
+                 {"endpoint-id": 2, "port-index": 0})["port-stats"]
+    cpre = pre.get("link-down-count", 0)
+    survived = True
+    try:
+        fab.do("port-set", {"endpoint-id": 2, "port-index": 0,
+                            "admin-state": "down"})
+        fab.do("port-set", {"endpoint-id": 2, "port-index": 0,
+                            "admin-state": "up"})
+        # detach then re-attach the endpoint (mutation on membership). An
+        # endpoint must be admin-down to leave its fabric (decoupled lifecycle
+        # invariant), so bring it down first and restore admin-up after.
+        fab.do("endpoint-set", {"endpoint-id": 2, "admin-state": "down"})
+        fab.do("endpoint-set", {"endpoint-id": 2, "fabric-id": 0})
+        fab.do("endpoint-set", {"endpoint-id": 2, "fabric-id": cfg.fid})
+        fab.do("endpoint-set", {"endpoint-id": 2, "admin-state": "up"})
+    except NlError as exc:
+        # The sim does not ordinarily reject this mutation-only sequence (no
+        # fault injection is armed here), so an unexpected failure here is a
+        # real ABI regression, not an environmental limitation.
+        survived = None
+        ksft.not_ok("stats-counters-survive-mutation",
+                    "mutation errno=%d" % L.nl_errno(exc))
+    if survived is not None:
+        post = fab.do("port-stats-get",
+                      {"endpoint-id": 2, "port-index": 0})["port-stats"]
+        ksft.check(post.get("link-down-count", 0) == cpre,
+                   "stats-counters-survive-mutation",
+                   "pre=%d post=%s" % (cpre, post.get("link-down-count")))
+    # Restore everything the sequence above can have changed, not just the
+    # port: a failure part-way through leaves the endpoint detached or
+    # admin-down, and skipping with that state still in place would silently
+    # change the topology every later case enumerates. Re-attaching requires
+    # admin-down first, so drive the full sequence back.
+    for cmd, req in (("endpoint-set", {"endpoint-id": 2, "admin-state": "down"}),
+                     ("endpoint-set", {"endpoint-id": 2, "fabric-id": cfg.fid}),
+                     ("endpoint-set", {"endpoint-id": 2, "admin-state": "up"}),
+                     ("port-set", {"endpoint-id": 2, "port-index": 0,
+                                   "admin-state": "up"})):
+        try:
+            fab.do(cmd, req)
+        except NlError:
+            pass
+    try:
+        L.dbg_write("ep2/port0/inject", "recover_to_active")
+    except OSError:
+        pass
+    # Assert the restore actually took: a silent failure here is exactly what
+    # would make a later, unrelated case fail instead of this one.
+    back = fab.do("endpoint-get", {"endpoint-id": 2})["endpoint"]
+    ksft.check(back.get("fabric-id") == cfg.fid and
+               back.get("admin-state") == "up",
+               "stats-mutation-endpoint-restored",
+               "fabric-id=%s admin-state=%s"
+               % (back.get("fabric-id"), back.get("admin-state")))
+
+
+def test_fabric_new_duplicate(ksft, cfg):
+    fab, NlError = cfg.fab, cfg.NlError
+    params = {"type": "synthetic", "name": "iid-uniq", "instance-id": 0x9999}
+
+    def fabric_cleanup(fabric_id):
+        def drop():
+            """Delete the fabric unless explicit cleanup already did."""
+            try:
+                fab.do("fabric-del", {"fabric-id": fabric_id})
+            except NlError as exc:
+                if L.nl_errno(exc) != errno.ENOENT:
+                    raise
+
+        return drop
+
+    try:
+        fabric_id = fab.do("fabric-new",
+                           {"fabric-new-params": params})["fabric-id"]
+    except NlError as exc:
+        ksft.not_ok("fabric-new-duplicate-instance-id-eexist",
+                    "setup fabric-new errno=%d" % L.nl_errno(exc))
+        return
+
+    L.on_teardown(fabric_cleanup(fabric_id))
+
+    dup = dict(params, name="iid-dup")
+    try:
+        duplicate = fab.do("fabric-new", {"fabric-new-params": dup})
+    except NlError as exc:
+        ksft.check(L.nl_errno(exc) == errno.EEXIST,
+                   "fabric-new-duplicate-instance-id-eexist",
+                   "errno=%d" % L.nl_errno(exc))
+    else:
+        # Arm cleanup before reporting: an accepted duplicate is a second
+        # live fabric that drop() above cannot reach.
+        dup_id = duplicate.get("fabric-id")
+        if dup_id is not None:
+            L.on_teardown(fabric_cleanup(dup_id))
+        ksft.not_ok("fabric-new-duplicate-instance-id-eexist",
+                    "duplicate instance-id accepted")
+
+    try:
+        fab.do("fabric-del", {"fabric-id": fabric_id})
+        ksft.ok("fabric-new-duplicate-cleanup-del")
+    except NlError as exc:
+        ksft.not_ok("fabric-new-duplicate-cleanup-del",
+                    "errno=%d" % L.nl_errno(exc))
+
+
 # Ordered scenario: each case builds on the topology/state left by the prior
 # one (e.g. the linear reload precedes its assertions, and the mesh reload
 # restores K_N for the stats cases). Keep this list in order.
@@ -351,10 +492,21 @@ CASES = (
     test_counters_stop,
     test_port_state_cycle,
     test_port_change_ntf,
+    test_endpoint_change_ntf,
     test_linear_topology,
     test_reload_mesh,
     test_port_change_ntf_full,
     test_link_down_exact_count,
+    test_stats_survive_mutation,
+    test_fabric_new_duplicate,
+)
+
+# Cases that exercise the topology-mutation uAPI.  On a query-only build the
+# family has no mutation ops, so these are filtered out.
+MUTATION_CASES = (
+    test_endpoint_change_ntf,
+    test_stats_survive_mutation,
+    test_fabric_new_duplicate,
 )
 
 
@@ -388,12 +540,12 @@ def main():
     except (OSError, NlError) as exc:
         ksft.skip_all("cannot open drm-fabric family: %s" % exc)
 
-    # fabric-id 0 is reserved; discover the live provider fabric id.
+    # fabric-id 0 is the reserved orphan sentinel; discover the live id.
     fabrics = fab.dump("fabric-get", {})
     fid = fabrics[0]["fabric"]["fabric-id"] if fabrics else 1
 
     cfg = Cfg(fab, fid, L.debugfs_available(), no_load, NlError)
-    L.run_cases(ksft, cfg, CASES)
+    L.run_cases(ksft, cfg, L.select_cases(fab, CASES, MUTATION_CASES))
     ksft.finish()
 
 

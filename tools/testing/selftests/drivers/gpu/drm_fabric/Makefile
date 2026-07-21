@@ -18,7 +18,10 @@ TEST_PROGS := \
 	hotplug_abi.py \
 	dump_scale_abi.py \
 	switch_abi.py \
+	cap_netadmin.py \
+	netns_abi.py \
 	fault_abi.py \
+	provisioning_scenarios_abi.py \
 	harness_reset_abi.py
 
 TEST_FILES := lib_drm_fabric.py

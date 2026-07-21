@@ -7,9 +7,6 @@ attrs (wrong type, unknown id, truncated nest, out-of-range enum, missing
 required) must return a clean NLMSG_ERROR, never an oops; a liveness dump
 confirms nothing wedged the family. Also introspects the family and emits
 TAP.
-
-Topology-mutation policy probes arrive with the provisioning ABI; this
-query-only build defines no mutation commands or attributes to probe.
 """
 
 import errno
@@ -116,34 +113,77 @@ def _parse_all_enums(text):
     return out
 
 
+# Symbols the uAPI defines on every build. Their absence means the header did
+# not parse or is not drm_fabric's, which is distinct from a query-only build
+# and must not be confused with one.
+_REQUIRED_SYMS = ("DRM_FABRIC_CMD_FABRIC_GET", "DRM_FABRIC_CMD_PORT_GET",
+                  "DRM_FABRIC_A_FABRIC_ID", "DRM_FABRIC_A_ENDPOINT_ID",
+                  "DRM_FABRIC_A_PORT_INDEX", "DRM_FABRIC_A_PEER",
+                  "DRM_FABRIC_A_PEER_ATTRS_PEER_ID",
+                  "DRM_FABRIC_A_PEER_ATTRS_TYPE", "__DRM_FABRIC_A_MAX")
+
+# Commands that exist only once topology provisioning is present. Whether the
+# header defines them describes the build, which is what lets a command missing
+# from the live family be reported as a failure instead of a skip.
+_MUTATION_CMDS = ("DRM_FABRIC_CMD_FABRIC_NEW", "DRM_FABRIC_CMD_FABRIC_DEL",
+                  "DRM_FABRIC_CMD_ENDPOINT_SET", "DRM_FABRIC_CMD_PORT_SET",
+                  "DRM_FABRIC_CMD_PORT_PEER_NEW",
+                  "DRM_FABRIC_CMD_PORT_PEER_DEL")
+_MUTATION_SYMS = _MUTATION_CMDS + ("DRM_FABRIC_A_ADMIN_STATE",
+                                  "DRM_FABRIC_A_FABRIC_NEW_PARAMS",
+                                  "DRM_FABRIC_A_FABRIC_NEW_PARAMS_TYPE")
+
+
 def _load_ids():
-    # Committed fallbacks (kept in sync with drm_fabric.h, query-only build).
-    syms = {"DRM_FABRIC_CMD_FABRIC_GET": 1, "DRM_FABRIC_CMD_PORT_GET": 3,
-            "DRM_FABRIC_A_FABRIC_ID": 5, "DRM_FABRIC_A_ENDPOINT_ID": 6,
-            "DRM_FABRIC_A_PORT_INDEX": 7, "DRM_FABRIC_A_PEER": 10}
-    src = "fallback literals"
+    """Resolve ids from the uAPI header, or report why we cannot; returns
+    (ids, header path) or (None, reason). Deliberately no built-in fallback
+    table: a stale entry wouldn't fail loudly, it would probe the wrong
+    attribute and still report success.
+    """
     hdr = _find_uapi_header()
-    if hdr:
-        parsed = _parse_all_enums(open(hdr).read())
-        if "DRM_FABRIC_CMD_PORT_GET" in parsed and "DRM_FABRIC_A_FABRIC_ID" in parsed:
-            syms, src = parsed, hdr
-    return syms, src
+    if not hdr:
+        return None, ("drm_fabric uAPI header not found; set "
+                      "UAPI_HEADER=/path/to/include/uapi/drm/drm_fabric.h")
+    syms = _parse_all_enums(open(hdr).read())
+    missing = [s for s in _REQUIRED_SYMS if s not in syms]
+    if missing:
+        return None, "%s does not define %s" % (hdr, ", ".join(missing))
+    return syms, hdr
 
 
-_SYMS, _ID_SRC = _load_ids()
+_IDS, _ID_SRC = _load_ids()
 
-CMD_FABRIC_GET = _SYMS["DRM_FABRIC_CMD_FABRIC_GET"]
-CMD_PORT_GET = _SYMS["DRM_FABRIC_CMD_PORT_GET"]
 
-A_FABRIC_ID = _SYMS["DRM_FABRIC_A_FABRIC_ID"]
-A_ENDPOINT_ID = _SYMS["DRM_FABRIC_A_ENDPOINT_ID"]
-A_PORT_INDEX = _SYMS["DRM_FABRIC_A_PORT_INDEX"]
+def _id(name):
+    """Value of @name, or None when this build's header does not define it."""
+    return _IDS.get(name) if _IDS else None
 
-# An attribute id guaranteed to be past the family's top-level maxattr, so the
-# kernel strict-rejects it. Derived from the parsed ids (one past the largest
-# symbol) rather than a magic literal, which would silently stop testing strict
-# rejection once the attribute set grows past it.
-A_UNKNOWN = max(_SYMS.values()) + 1
+
+CMD_FABRIC_GET = _id("DRM_FABRIC_CMD_FABRIC_GET")
+CMD_PORT_GET = _id("DRM_FABRIC_CMD_PORT_GET")
+CMD_PORT_SET = _id("DRM_FABRIC_CMD_PORT_SET")
+CMD_PORT_PEER_NEW = _id("DRM_FABRIC_CMD_PORT_PEER_NEW")
+CMD_FABRIC_NEW = _id("DRM_FABRIC_CMD_FABRIC_NEW")
+
+A_FABRIC_ID = _id("DRM_FABRIC_A_FABRIC_ID")
+A_ENDPOINT_ID = _id("DRM_FABRIC_A_ENDPOINT_ID")
+A_PORT_INDEX = _id("DRM_FABRIC_A_PORT_INDEX")
+A_ADMIN_STATE = _id("DRM_FABRIC_A_ADMIN_STATE")
+A_PEER = _id("DRM_FABRIC_A_PEER")
+A_FABRIC_NEW_PARAMS = _id("DRM_FABRIC_A_FABRIC_NEW_PARAMS")
+
+A_PEER_PEER_ID = _id("DRM_FABRIC_A_PEER_ATTRS_PEER_ID")
+A_PEER_TYPE = _id("DRM_FABRIC_A_PEER_ATTRS_TYPE")
+A_FABRIC_NEW_PARAMS_TYPE = _id("DRM_FABRIC_A_FABRIC_NEW_PARAMS_TYPE")
+
+# One past the top-level attribute set's upper bound, so every command
+# strict-rejects it: no per-command maxattr can exceed the set it indexes.
+# __DRM_FABRIC_A_MAX is that value by construction, so this tracks the set as
+# it grows instead of quietly aliasing a real attribute once it does.
+A_UNKNOWN = _id("__DRM_FABRIC_A_MAX")
+
+# What the build supports, as opposed to what the running family advertises.
+BUILD_HAS_MUTATION = bool(_IDS) and all(s in _IDS for s in _MUTATION_SYMS)
 
 
 # NLA builders
@@ -156,6 +196,17 @@ def nla(attr_type, payload):
     length = 4 + len(payload)
     pad = b"\x00" * (_align4(length) - length)
     return struct.pack("=HH", length, attr_type) + payload + pad
+
+
+def nla_nest(attr_type, payload):
+    """Build a nest the way a real client does.
+
+    Strict validation rejects an attribute the policy declares as a nest
+    unless NLA_F_NESTED is set, before it ever recurses into the nested
+    policy. Without the flag a probe aimed at a nested member only ever
+    reaches the outer parse.
+    """
+    return nla(attr_type | NLA_F_NESTED, payload)
 
 
 def nla_u32(attr_type, val):
@@ -171,6 +222,16 @@ def build_msg(family_id, cmd, seq, payload, flags=NLM_F_REQUEST | NLM_F_ACK):
     total = NLMSG_HDRLEN + len(body)
     nlh = struct.pack("=IHHII", total, family_id, flags, seq, 0)
     return nlh + body
+
+
+# One counter for every request the suite sends, so each reply can be matched
+# to the request that caused it and no two requests ever share a sequence.
+_SEQ = [100]
+
+
+def _next_seq():
+    _SEQ[0] += 1
+    return _SEQ[0]
 
 
 # Socket helpers
@@ -234,17 +295,32 @@ def drain(sock, first_timeout=0.5, more_timeout=0.3):
     return msgs
 
 
+def _getfamily(sock, name):
+    """Send one CTRL_CMD_GETFAMILY and return the datagram that answers it.
+    Only a reply matching our own sequence is accepted: an earlier request's
+    queued ACK or late reply would otherwise look like a family that
+    advertises nothing, silently disabling every introspection check.
+    """
+    seq = _next_seq()
+    sock.send(build_msg(GENL_ID_CTRL, CTRL_CMD_GETFAMILY, seq,
+                        nla(CTRL_ATTR_FAMILY_NAME, name + b"\x00"),
+                        flags=NLM_F_REQUEST))
+    while True:
+        try:
+            data = sock.recv(65536)
+        except socket.timeout:
+            return None
+        (_, mtype, _, mseq, _) = struct.unpack_from("=IHHII", data, 0)
+        if mseq != seq:
+            continue
+        if mtype == NLMSG_ERROR:
+            return None
+        return data
+
+
 def resolve_family(sock, name):
-    seq = 1
-    msg = build_msg(GENL_ID_CTRL, CTRL_CMD_GETFAMILY, seq,
-                    nla(CTRL_ATTR_FAMILY_NAME, name + b"\x00"))
-    sock.send(msg)
-    try:
-        data = sock.recv(8192)
-    except socket.timeout:
-        return None
-    (_, mtype, _, _, _) = struct.unpack_from("=IHHII", data, 0)
-    if mtype == NLMSG_ERROR:
+    data = _getfamily(sock, name)
+    if data is None:
         return None
     attrs = data[NLMSG_HDRLEN + GENL_HDRLEN:]
     for atype, payload in iter_attrs(attrs):
@@ -263,17 +339,8 @@ def get_family_info(sock, name):
     letting callers confirm version, admin-perm on mutators, and the
     monitor group.
     """
-    seq = 2
-    msg = build_msg(GENL_ID_CTRL, CTRL_CMD_GETFAMILY, seq,
-                    nla(CTRL_ATTR_FAMILY_NAME, name + b"\x00"),
-                    flags=NLM_F_REQUEST)
-    sock.send(msg)
-    try:
-        data = sock.recv(65536)
-    except socket.timeout:
-        return None
-    (_, mtype, _, _, _) = struct.unpack_from("=IHHII", data, 0)
-    if mtype == NLMSG_ERROR:
+    data = _getfamily(sock, name)
+    if data is None:
         return None
 
     info = {"version": None, "ops": {}, "mcast": set()}
@@ -306,17 +373,13 @@ def get_family_info(sock, name):
 # dynamic plan printed at finish() instead of a hard-coded count that drifts
 # every time a case is added or removed.
 
-_SEQ = [100]
-
-
 def case_rejected(tap, name, sock, fid, cmd, payload, expect):
     """Pass iff the kernel rejected with one of @expect (positive errno
     values; the netlink error is negative, so we compare -e). The specific
     code matters: e.g. -EINVAL for a malformed attribute, not a generic
     failure.
     """
-    _SEQ[0] += 1
-    sock.send(build_msg(fid, cmd, _SEQ[0], payload))
+    sock.send(build_msg(fid, cmd, _next_seq(), payload))
     msgs = drain(sock)
     rejected = [-e for (t, e) in msgs
                if t == NLMSG_ERROR and e is not None and e != 0]
@@ -364,12 +427,22 @@ class Cfg:
     def __init__(self, sock, fid):
         self.sock = sock
         self.fid = fid
+        # Whether the running family advertises the mutation commands, from
+        # live introspection in main(): True, False, or None when the
+        # introspection itself failed. The three states are kept apart because
+        # "this build has no mutation commands" is a skip while "this build has
+        # them but the family does not offer them" is a failure.
+        self.live_mutation = None
 
 
 def test_malformed_requests(ksft, cfg):
     sock, fid = cfg.sock, cfg.fid
     # Malformed framing/attributes must fail validation with -EINVAL.
     EINVAL = {errno.EINVAL}
+    # Out-of-range enums are caught by the generated NLA_POLICY range checks,
+    # which report -ERANGE and nothing else. Accepting -EINVAL as well would
+    # let a malformed probe that never reaches the range check pass silently.
+    ERANGE = {errno.ERANGE}
 
     case_rejected(ksft, "wrong-type-short-u32", sock, fid, CMD_FABRIC_GET,
                   nla(A_FABRIC_ID, struct.pack("=H", 1)), EINVAL)
@@ -377,8 +450,77 @@ def test_malformed_requests(ksft, cfg):
     case_rejected(ksft, "unknown-attribute-id", sock, fid, CMD_FABRIC_GET,
                   nla_u32(A_FABRIC_ID, 1) + nla_u32(A_UNKNOWN, 0), EINVAL)
 
+    # Policy errors are unreachable when mutation commands are absent.
+    if cfg.live_mutation:
+        # Truncated nest: PEER header claims 64 bytes but carries 4. Rejected
+        # while walking the attributes, before any policy runs.
+        bad_nest = (struct.pack("=HH", 64, A_PEER | NLA_F_NESTED) +
+                    b"\x00\x00\x00\x00")
+        case_rejected(ksft, "truncated-nest", sock, fid, CMD_PORT_PEER_NEW,
+                      nla_u32(A_ENDPOINT_ID, 0) + nla_u32(A_PORT_INDEX, 0) + bad_nest,
+                      EINVAL)
+
+        # Out-of-range enum: admin-state past DRM_FABRIC_ADMIN_UP.
+        case_rejected(ksft, "enum-range-admin-state", sock, fid, CMD_PORT_SET,
+                      nla_u32(A_ENDPOINT_ID, 0) + nla_u32(A_PORT_INDEX, 0) +
+                      nla_u32(A_ADMIN_STATE, 0xFFFFFFFF), ERANGE)
+
+        # Out-of-range enum: peer-type past DRM_FABRIC_PEER_SWITCH, inside a
+        # nest, so this only reaches the nested policy as a well-formed nest.
+        peer = nla_u64(A_PEER_PEER_ID, 0x1) + nla_u32(A_PEER_TYPE, 99)
+        case_rejected(ksft, "enum-range-peer-type", sock, fid, CMD_PORT_PEER_NEW,
+                      nla_u32(A_ENDPOINT_ID, 0) + nla_u32(A_PORT_INDEX, 0) +
+                      nla_nest(A_PEER, peer), ERANGE)
+
+        # Zero fabric-type, which the enum starts above and so never names.
+        # The range check runs before the doit, so the refusal predates any
+        # fabric the request could have created, which the next case asserts.
+        before = fabric_count(sock, fid)
+        case_rejected(ksft, "enum-range-fabric-type", sock, fid, CMD_FABRIC_NEW,
+                      nla_nest(A_FABRIC_NEW_PARAMS,
+                               nla_u32(A_FABRIC_NEW_PARAMS_TYPE, 0)),
+                      ERANGE)
+        after = fabric_count(sock, fid)
+        ksft.check(before is not None and after == before,
+                   "enum-range-fabric-type-not-created",
+                   "fabrics before=%s after=%s" % (before, after))
+    else:
+        # The case set stays the same either way -- the probes are reported
+        # rather than silently omitted -- but only a query-only build earns a
+        # skip. If this build defines the mutation commands and the family does
+        # not offer them, the probes are unrunnable for a reason worth seeing.
+        if cfg.live_mutation is None:
+            report, why = ksft.not_ok, ("family introspection failed; cannot "
+                                        "tell which commands are advertised")
+        elif BUILD_HAS_MUTATION:
+            report, why = ksft.not_ok, ("uAPI header defines the mutation "
+                                        "commands but the family advertises "
+                                        "none")
+        else:
+            report, why = ksft.skip, ("query-only build: uAPI header defines "
+                                      "no mutation commands")
+        for nm in ("truncated-nest", "enum-range-admin-state",
+                   "enum-range-peer-type", "enum-range-fabric-type",
+                   "enum-range-fabric-type-not-created"):
+            report(nm, why)
+
     case_rejected(ksft, "missing-required-port-index", sock, fid, CMD_PORT_GET,
                   nla_u32(A_ENDPOINT_ID, 0), EINVAL)
+
+
+def fabric_count(sock, fid):
+    """Fabrics a dump reports, or None when the dump itself did not succeed.
+
+    None is distinct from zero on purpose: a dump that errored says nothing
+    about how many fabrics exist, and reporting it as zero would let a broken
+    dump satisfy a claim that nothing was created.
+    """
+    sock.send(build_msg(fid, CMD_FABRIC_GET, _next_seq(), b"",
+                        flags=NLM_F_REQUEST | NLM_F_DUMP))
+    msgs = drain(sock)
+    if not msgs or any(t == NLMSG_ERROR and e != 0 for (t, e) in msgs):
+        return None
+    return sum(1 for (t, _) in msgs if t not in (NLMSG_ERROR, NLMSG_DONE))
 
 
 def test_liveness(ksft, cfg):
@@ -388,8 +530,7 @@ def test_liveness(ksft, cfg):
     (no data records, just a clean DONE) is still a pass.
     """
     sock, fid = cfg.sock, cfg.fid
-    _SEQ[0] += 1
-    sock.send(build_msg(fid, CMD_FABRIC_GET, _SEQ[0], b"",
+    sock.send(build_msg(fid, CMD_FABRIC_GET, _next_seq(), b"",
                         flags=NLM_F_REQUEST | NLM_F_DUMP))
     msgs = drain(sock)
     errs = [e for (t, e) in msgs if t == NLMSG_ERROR and e != 0]
@@ -412,15 +553,16 @@ def test_liveness(ksft, cfg):
 
 def test_family_introspection(ksft, cfg):
     """Via CTRL_CMD_GETFAMILY: version, admin-perm gating, mcast surface."""
-    getter_ids = [_SYMS[n] for n in (
+    mutator_ids = [_id(n) for n in _MUTATION_CMDS if _id(n) is not None]
+    getter_ids = [_id(n) for n in (
         "DRM_FABRIC_CMD_FABRIC_GET", "DRM_FABRIC_CMD_ENDPOINT_GET",
         "DRM_FABRIC_CMD_PORT_GET", "DRM_FABRIC_CMD_PORT_STATS_GET")
-        if n in _SYMS]
+        if _id(n) is not None]
 
     info = get_family_info(cfg.sock, FAMILY_NAME)
     if not info:
         for nm in ("genl-family-version", "genl-mcast-monitor-present",
-                   "genl-getters-not-admin-perm"):
+                   "genl-mutators-admin-perm", "genl-getters-not-admin-perm"):
             ksft.not_ok(nm, "CTRL_CMD_GETFAMILY introspection failed")
         return
 
@@ -437,8 +579,19 @@ def test_family_introspection(ksft, cfg):
                     "groups=%s" % info["mcast"])
 
     ops = info["ops"]
-    # A query-only build exposes getters only: each must be ungated (no
-    # GENL_ADMIN_PERM), so a normal namespace can enumerate topology.
+    # The mutator admin-perm gate only applies once the mutation commands exist
+    # at all; a query-only build registers no mutators to check. Gate on the
+    # build rather than on the live family, so a build that should advertise
+    # mutators but does not fails here instead of dropping the check.
+    if BUILD_HAS_MUTATION:
+        seen_mut = [c for c in mutator_ids if c in ops]
+        bad_mut = [c for c in seen_mut if not (ops[c] & GENL_ADMIN_PERM)]
+        if seen_mut and not bad_mut:
+            ksft.ok("genl-mutators-admin-perm (%d cmds)" % len(seen_mut))
+        else:
+            ksft.not_ok("genl-mutators-admin-perm",
+                        "seen=%s missing-perm=%s" % (seen_mut, bad_mut))
+
     seen_get = [c for c in getter_ids if c in ops]
     bad_get = [c for c in seen_get if ops[c] & GENL_ADMIN_PERM]
     if seen_get and not bad_get:
@@ -461,6 +614,11 @@ def main():
     if os.geteuid() != 0:
         tap.skip_all("root is required to load drm_fabric modules")
 
+    # Every probe below is built from uAPI ids, so without them there is
+    # nothing trustworthy to send.
+    if _IDS is None:
+        tap.skip_all(_ID_SRC)
+
     if _maybe_load_modules():
         L.on_teardown(_unload_providers)
 
@@ -476,7 +634,15 @@ def main():
 
     sys.stderr.write("# attribute/command ids from: %s\n" % _ID_SRC)
 
+    # Ask the live family which of the topology-mutation commands it actually
+    # offers. Left as None when the introspection fails, so the probes gated on
+    # it report that rather than treating an unanswered question as a no.
     cfg = Cfg(sock, fid)
+    info = get_family_info(sock, FAMILY_NAME)
+    if info is not None:
+        cfg.live_mutation = any(_id(n) in info["ops"] for n in _MUTATION_CMDS
+                                if _id(n) is not None)
+
     L.run_cases(tap, cfg, CASES)
     tap.finish()
 

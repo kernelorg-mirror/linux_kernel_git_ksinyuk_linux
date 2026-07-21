@@ -4,7 +4,7 @@
 drm_fabric selftests
 ====================
 
-These selftests exercise the ``drm-fabric`` query uAPI against
+These selftests exercise the ``drm-fabric`` query and mutation uAPI against
 ``drm_fabric_sim`` using the in-tree YNL library. KUnit covers the core object
 model.
 
@@ -45,7 +45,7 @@ Suites
   ends the dump.
 
 ``hotplug_abi.py``
-  Endpoint hotplug: CREATE/DELETE notifications.
+  Endpoint hotplug: CREATE/DELETE NTFs and mutation round-trips.
 
 ``dump_scale_abi.py``
   Dump resume under many endpoints (``bulk_add``).
@@ -54,9 +54,18 @@ Suites
   Opaque switch peers whose identifiers do not resolve to an endpoint
   (``topology=switch``).
 
+``cap_netadmin.py``
+  ``CAP_NET_ADMIN`` enforcement for mutation commands.
+
+``netns_abi.py``
+  Rejects commands outside ``init_net``, including with ``CAP_NET_ADMIN``.
+
 ``fault_abi.py``
-  Provider fault injection: errno propagation and no leaked endpoint
+  Provider failures: errno propagation, rollback and no notification
   (``fail_*``).
+
+``provisioning_scenarios_abi.py``
+  Endpoint, port and peer provisioning scenarios.
 
 ``harness_reset_abi.py``
   Recovery after a SIGKILL-terminated predecessor.
@@ -71,6 +80,7 @@ A SKIP means a required precondition was unavailable.
 
 Environment
   ``check-spec-regen.sh`` needs PyYAML and writable temporary storage.
+  ``netns_abi.py`` needs ``CONFIG_NET_NS``.
 
 Per case
   A case skips when a required control, parameter or family capability is
@@ -81,7 +91,7 @@ Whole suite
 
 Timing
   The two ``dump_intr_abi.py`` boundary cases may skip if the concurrent
-  topology change misses the required dump boundary.
+  mutation misses the required dump boundary.
 
 KUnit
 -----
